@@ -23,10 +23,6 @@ import functions_framework
 from settletax_classifier import SettleTaxClassifier
 
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-
 def _json_response(data: dict, status: int = 200):
     """Return a (body, status, headers) tuple for Cloud Functions."""
     return (
