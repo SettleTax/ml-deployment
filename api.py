@@ -92,32 +92,6 @@ class UserBatch(BaseModel):
     user_history: Optional[Dict[str, dict]] = Field(None)
 
 
-class MultiUserRequest(BaseModel):
-    """
-    Classify transactions for multiple users in one optimised call.
-
-    Example:
-    [
-      {
-        "account_name": "JOHN ADEYEMI",
-        "transactions": [
-          {"narration": "MTN AIRTIME PURCHASE", "amount": 1000, "direction": "debit"},
-          {"narration": "SALARY CREDIT", "amount": 350000, "direction": "credit"}
-        ]
-      },
-      {
-        "account_name": "AMAKA OKONKWO",
-        "transactions": [
-          {"narration": "MTN AIRTIME PURCHASE", "amount": 500, "direction": "debit"}
-        ]
-      }
-    ]
-    """
-    users: List[UserBatch] = Field(..., min_length=1)
-    llm_api_key: Optional[str] = Field(None)
-    llm_provider: Optional[str] = Field("anthropic")
-    llm_enabled: Optional[bool] = Field(True)
-
 
 class ClassifyResult(BaseModel):
     category: Optional[str]
@@ -273,18 +247,15 @@ def classify_batch(req: BatchRequest):
 
 
 @app.post("/classify/multi-user", response_model=MultiUserResponse)
-def classify_multi_user(req: MultiUserRequest):
+def classify_multi_user(
+    users: List[UserBatch],
+    llm_enabled: bool = True,
+    llm_provider: str = "anthropic",
+):
     """
     Classify transactions for multiple users in one optimised call.
 
-    Compared to calling /classify/batch once per user:
-    - Layers 1-3 run in parallel across all users.
-    - LLM-needing transactions are deduplicated across ALL users before
-      calling the LLM — same narration from 50 users = 1 LLM call.
-    - Results are cached in the server-level NarrationCache so subsequent
-      requests benefit immediately.
-
-    Send an array of user objects, each with account_name + transactions:
+    Body is a plain JSON array — one object per user:
     ```json
     [
       {
@@ -302,23 +273,23 @@ def classify_multi_user(req: MultiUserRequest):
       }
     ]
     ```
-    Wrap the array in `{"users": [...]}` when posting.
+    LLM settings are query params: ?llm_enabled=true&llm_provider=anthropic
+    API key is read from the ANTHROPIC_API_KEY / OPENAI_API_KEY env var.
     """
     try:
         import pandas as pd
 
-        provider = req.llm_provider or "anthropic"
-        api_key = _resolve_api_key(req.llm_api_key, provider)
+        api_key = _resolve_api_key(None, llm_provider)
 
         # Build one classifier per user, all sharing the module-level cache
         classifiers_and_dfs = []
-        for user in req.users:
+        for user in users:
             classifier = SettleTaxClassifier(
                 account_name=user.account_name,
                 account_names=user.account_names,
                 user_history=user.user_history,
-                llm_api_key=api_key if req.llm_enabled else None,
-                llm_provider=provider,
+                llm_api_key=api_key if llm_enabled else None,
+                llm_provider=llm_provider,
                 shared_cache=_shared_cache,
             )
             rows = [
@@ -336,13 +307,13 @@ def classify_multi_user(req: MultiUserRequest):
         result_dfs = SettleTaxClassifier.classify_batch_multi_user(
             classifiers_and_dfs,
             shared_cache=_shared_cache,
-            llm_enabled=req.llm_enabled,
+            llm_enabled=llm_enabled,
         )
 
         # Build response
         user_results = []
         for user, result_df, (classifier, _) in zip(
-            req.users, result_dfs, classifiers_and_dfs
+            users, result_dfs, classifiers_and_dfs
         ):
             results = []
             for _, row in result_df.iterrows():
