@@ -42,7 +42,6 @@ def _parse_body(request) -> dict:
 def _build_classifier(body: dict) -> SettleTaxClassifier:
     provider = body.get("llm_provider", "anthropic")
 
-    # API key: request body first, then env var
     api_key = body.get("llm_api_key")
     if not api_key:
         api_key = (
@@ -51,7 +50,6 @@ def _build_classifier(body: dict) -> SettleTaxClassifier:
             else os.environ.get("ANTHROPIC_API_KEY")
         )
 
-    # Disable LLM if caller explicitly opts out
     if not body.get("llm_enabled", True):
         api_key = None
 
@@ -68,10 +66,6 @@ def _result_to_dict(result) -> dict:
     d = result.to_dict()
     return d
 
-
-# ─────────────────────────────────────────────
-# Route handlers
-# ─────────────────────────────────────────────
 
 def _handle_single(body: dict):
     if not body.get("account_name"):
