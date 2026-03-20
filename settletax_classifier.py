@@ -1190,6 +1190,61 @@ class CounterpartyExtractor:
 
 
 # ═══════════════════════════════════════════════════════════════
+# NARRATION CACHE (Layer 0 — cross-user, cross-batch dedup)
+# ═══════════════════════════════════════════════════════════════
+
+class NarrationCache:
+    """
+    Global in-memory cache keyed by a normalized narration fingerprint.
+
+    Why this matters:
+    - 50 users × 500 txns = 25,000 transactions.
+    - A single "AIRTIME PURCHASE MTN" narration may appear hundreds of
+      times across all users. Without a cache, each one hits LLM.
+    - With this cache, LLM is called once; every subsequent identical
+      narration gets the cached result instantly.
+
+    Normalization strips digits and references so that:
+      "NIP TRANSFER TO JOHN 20250101 REF123456"  →  same key as
+      "NIP TRANSFER TO JOHN 20250215 REF789012"
+    Only cache high-confidence results (≥ 0.70) to avoid propagating
+    uncertain classifications.
+    """
+
+    def __init__(self, max_size: int = 50_000):
+        self._cache: Dict[str, "ClassifyResult"] = {}
+        self._max_size = max_size
+
+    def _key(self, narration: str, direction: str) -> str:
+        """Build a stable fingerprint from a narration + direction."""
+        # Collapse digit sequences (dates, refs, amounts embedded in text)
+        normalized = re.sub(r"\d+", "#", narration.upper().strip())
+        # Collapse whitespace
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return f"{direction}:{normalized}"
+
+    def get(self, narration: str, direction: str) -> Optional["ClassifyResult"]:
+        return self._cache.get(self._key(narration, direction))
+
+    def set(self, narration: str, direction: str, result: "ClassifyResult"):
+        # Only cache confident results to avoid spreading wrong classifications
+        if result.confidence < 0.70:
+            return
+        if len(self._cache) >= self._max_size:
+            # Evict oldest 10 % (dict preserves insertion order in Python 3.7+)
+            evict_count = self._max_size // 10
+            for k in list(self._cache.keys())[:evict_count]:
+                del self._cache[k]
+        self._cache[self._key(narration, direction)] = result
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def stats(self) -> dict:
+        return {"cached_narrations": len(self._cache), "max_size": self._max_size}
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN CLASSIFIER — ORCHESTRATES ALL 4 LAYERS
 # ═══════════════════════════════════════════════════════════════
 
@@ -1222,6 +1277,7 @@ class SettleTaxClassifier:
         llm_api_key: Optional[str] = None,
         llm_provider: str = "anthropic",
         llm_model: str = "claude-sonnet-4-20250514",
+        shared_cache: Optional[NarrationCache] = None,
     ):
         self.structural = StructuralDetector(account_name, account_names)
         self.history = UserHistoryMatcher(user_history)
@@ -1233,13 +1289,18 @@ class SettleTaxClassifier:
         )
         self.counterparty_extractor = CounterpartyExtractor()
 
+        # Shared narration cache — pass the same instance across users to
+        # get cross-user deduplication (Layer 0).
+        self._cache: NarrationCache = shared_cache or NarrationCache()
+
         # Stats tracking
         self.stats = {
             "total": 0,
-            "structural": 0,
-            "user_history": 0,
-            "rule": 0,
-            "llm": 0,
+            "cache_hit": 0,      # Layer 0
+            "structural": 0,     # Layer 1
+            "user_history": 0,   # Layer 2
+            "rule": 0,           # Layer 3
+            "llm": 0,            # Layer 4
             "unclassified": 0,
         }
 
@@ -1256,28 +1317,42 @@ class SettleTaxClassifier:
         # Extract counterparty for all layers
         counterparty = self.counterparty_extractor.extract(narration)
 
-        # Layer 1: Structural Detection
+        # ── Layer 0: Narration cache ──────────────────────────────────────────
+        # Fastest path: identical (or structurally identical) narration has
+        # been classified before — return cached result immediately.
+        cached = self._cache.get(narration, direction)
+        if cached:
+            # Re-use cached result but preserve this transaction's counterparty
+            from dataclasses import replace as dc_replace
+            result = dc_replace(cached, counterparty=cached.counterparty or counterparty)
+            self.stats["cache_hit"] += 1
+            return result
+
+        # ── Layer 1: Structural Detection ─────────────────────────────────────
         result = self.structural.classify(narration, amount, direction)
         if result:
             result.counterparty = result.counterparty or counterparty
             self.stats["structural"] += 1
+            self._cache.set(narration, direction, result)
             return result
 
-        # Layer 2: User History
+        # ── Layer 2: User History ─────────────────────────────────────────────
         result = self.history.classify(counterparty)
         if result:
             result.counterparty = counterparty
             self.stats["user_history"] += 1
+            self._cache.set(narration, direction, result)
             return result
 
-        # Layer 3: Rule Engine
+        # ── Layer 3: Rule Engine ──────────────────────────────────────────────
         result = self.rules.classify(narration, direction, amount)
         if result:
             result.counterparty = counterparty
             self.stats["rule"] += 1
+            self._cache.set(narration, direction, result)
             return result
 
-        # Layer 4: Falls through — will be batched for LLM
+        # ── Layer 4: Falls through — will be batched for LLM ─────────────────
         self.stats["unclassified"] += 1
         return ClassifyResult(
             category=None,
@@ -1336,28 +1411,55 @@ class SettleTaxClassifier:
 
         # Layer 4: Batch LLM classification for unclassified
         if llm_queue:
+            # ── Deduplication ────────────────────────────────────────────────
+            # Many transactions within the same 500-row batch share identical
+            # narration patterns (e.g., weekly DSTV payments, recurring airtime
+            # top-ups). Send each unique narration to LLM only once, then fan
+            # the result out to all matching rows.
+            unique_items: Dict[str, dict] = {}   # cache_key → first item
+            key_for: List[str] = []              # parallel to llm_queue
+            for item in llm_queue:
+                k = self._cache._key(item["narration"], item["direction"])
+                key_for.append(k)
+                if k not in unique_items:
+                    unique_items[k] = item
+
+            # Call LLM only for the unique narrations
             all_categories = sorted(ALL_CATEGORIES)
-            for batch_start in range(0, len(llm_queue), self.llm.batch_size):
-                batch = llm_queue[batch_start:batch_start + self.llm.batch_size]
+            llm_result_by_key: Dict[str, ClassifyResult] = {}
+            unique_list = list(unique_items.values())
+
+            for batch_start in range(0, len(unique_list), self.llm.batch_size):
+                batch = unique_list[batch_start:batch_start + self.llm.batch_size]
                 llm_results = self.llm.classify_batch(
                     [{"narration": t["narration"], "amount": t["amount"],
                       "direction": t["direction"], "date": t["date"]}
                      for t in batch],
                     all_categories,
                 )
-                for i, llm_result in enumerate(llm_results):
-                    df_idx = batch[i]["df_idx"]
+                for item, llm_result in zip(batch, llm_results):
                     llm_result.counterparty = self.counterparty_extractor.extract(
-                        batch[i]["narration"]
+                        item["narration"]
                     )
-                    # Update results
-                    for j, (ridx, rval) in enumerate(results):
-                        if ridx == df_idx and rval is None:
-                            results[j] = (df_idx, llm_result)
-                            if llm_result.source == ClassificationSource.LLM:
-                                self.stats["llm"] += 1
-                                self.stats["unclassified"] -= 1
-                            break
+                    k = self._cache._key(item["narration"], item["direction"])
+                    llm_result_by_key[k] = llm_result
+                    # Write to cache so this result is reused for future batches
+                    # and future users sharing the same shared_cache instance.
+                    self._cache.set(item["narration"], item["direction"], llm_result)
+
+            # Fan results back to every transaction in llm_queue
+            result_map_idx = {idx: j for j, (idx, _) in enumerate(results)}
+            for item, k in zip(llm_queue, key_for):
+                llm_result = llm_result_by_key.get(k)
+                if llm_result is None:
+                    continue
+                df_idx = item["df_idx"]
+                j = result_map_idx.get(df_idx)
+                if j is not None and results[j][1] is None:
+                    results[j] = (df_idx, llm_result)
+                    if llm_result.source == ClassificationSource.LLM:
+                        self.stats["llm"] += 1
+                        self.stats["unclassified"] -= 1
 
         # Add results to DataFrame
         result_map = {idx: r for idx, r in results}
@@ -1379,16 +1481,18 @@ class SettleTaxClassifier:
             print("No transactions classified yet.")
             return
 
-        print(f"\n{'='*50}")
+        print(f"\n{'='*55}")
         print(f"SettleTax Classification Results")
-        print(f"{'='*50}")
+        print(f"{'='*55}")
         print(f"Total transactions: {total}")
-        print(f"  Layer 1 (Structural):    {self.stats['structural']:>4} ({self.stats['structural']/total*100:.1f}%)")
-        print(f"  Layer 2 (User History):  {self.stats['user_history']:>4} ({self.stats['user_history']/total*100:.1f}%)")
-        print(f"  Layer 3 (Rules):         {self.stats['rule']:>4} ({self.stats['rule']/total*100:.1f}%)")
-        print(f"  Layer 4 (LLM):           {self.stats['llm']:>4} ({self.stats['llm']/total*100:.1f}%)")
-        print(f"  Unclassified:            {self.stats['unclassified']:>4} ({self.stats['unclassified']/total*100:.1f}%)")
-        print(f"{'='*50}")
+        print(f"  Layer 0 (Cache hit):     {self.stats['cache_hit']:>5} ({self.stats['cache_hit']/total*100:.1f}%)")
+        print(f"  Layer 1 (Structural):    {self.stats['structural']:>5} ({self.stats['structural']/total*100:.1f}%)")
+        print(f"  Layer 2 (User History):  {self.stats['user_history']:>5} ({self.stats['user_history']/total*100:.1f}%)")
+        print(f"  Layer 3 (Rules):         {self.stats['rule']:>5} ({self.stats['rule']/total*100:.1f}%)")
+        print(f"  Layer 4 (LLM):           {self.stats['llm']:>5} ({self.stats['llm']/total*100:.1f}%)")
+        print(f"  Unclassified:            {self.stats['unclassified']:>5} ({self.stats['unclassified']/total*100:.1f}%)")
+        print(f"  Cache size:              {len(self._cache):>5} entries")
+        print(f"{'='*55}")
 
     def learn_from_user(
         self, counterparty: str, category: str, tx_type: str
@@ -1399,6 +1503,185 @@ class SettleTaxClassifier:
         """
         if counterparty:
             self.history.add_mapping(counterparty, category, tx_type, source="user")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MULTI-USER BATCH — optimised for many concurrent users
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def classify_batch_multi_user(
+        classifiers_and_dfs: List[tuple],
+        shared_cache: Optional[NarrationCache] = None,
+        llm_enabled: bool = True,
+        max_workers: int = 8,
+    ) -> List:
+        """
+        Classify transactions for MULTIPLE users in one optimised pass.
+
+        Call this instead of calling classify_batch() per-user when you
+        have many users' DataFrames arriving at the same time (e.g. 50
+        users each with 500 transactions = 25,000 rows).
+
+        Optimisations vs. calling classify_batch() in a loop:
+        1. Layers 1-3 run in parallel (ThreadPoolExecutor).
+        2. All LLM-needing transactions from EVERY user are collected,
+           deduplicated by narration fingerprint, and sent to the LLM in
+           the minimum number of API calls.
+        3. LLM results are written to the shared_cache so subsequent
+           requests (more users, next API call) benefit immediately.
+
+        Args:
+            classifiers_and_dfs: List of (SettleTaxClassifier, DataFrame)
+                                  tuples, one per user.
+            shared_cache:         A NarrationCache instance shared across all
+                                  classifiers. If None, one is created and
+                                  injected into every classifier.
+            llm_enabled:          Set False to skip LLM entirely.
+            max_workers:          Thread count for parallel Layers 1-3.
+
+        Returns:
+            List of classified DataFrames, in the same order as input.
+
+        Usage:
+            cache = NarrationCache()
+            classifiers = [
+                SettleTaxClassifier(account_name=u["name"], shared_cache=cache)
+                for u in users
+            ]
+            results = SettleTaxClassifier.classify_batch_multi_user(
+                list(zip(classifiers, user_dfs)),
+                shared_cache=cache,
+            )
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if shared_cache is None:
+            shared_cache = NarrationCache()
+
+        # Inject the shared cache into every classifier so Layer 0 works
+        # across all of them.
+        for classifier, _ in classifiers_and_dfs:
+            classifier._cache = shared_cache
+
+        n_users = len(classifiers_and_dfs)
+        # Slot to store per-user intermediate results
+        processed: List[Optional[tuple]] = [None] * n_users
+
+        # ── Phase 1: Layers 1-3 in parallel ──────────────────────────────────
+        def _run_layers_1_to_3(args):
+            """Run one user's transactions through layers 0-3, return LLM queue."""
+            user_idx, (classifier, df) = args
+            df = df.copy()
+            if "Remarks" in df.columns and "narration" not in df.columns:
+                df["narration"] = df["Remarks"]
+            if "Trans_Date" in df.columns and "date" not in df.columns:
+                df["date"] = df["Trans_Date"]
+
+            results = []
+            llm_queue = []
+
+            for idx, row in df.iterrows():
+                narration = str(row.get("narration", row.get("Remarks", "")))
+                amount = float(row.get("amount", 0))
+                direction = str(row.get("direction", "debit")).lower()
+                date = str(row.get("date", row.get("Trans_Date", "")))
+
+                result = classifier.classify_single(narration, amount, direction, date)
+
+                if result.source == ClassificationSource.UNCLASSIFIED and llm_enabled:
+                    llm_queue.append({
+                        "df_idx": idx,
+                        "narration": narration,
+                        "amount": amount,
+                        "direction": direction,
+                        "date": date,
+                    })
+                    results.append((idx, None))
+                else:
+                    results.append((idx, result))
+
+            return user_idx, df, results, llm_queue
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, n_users)) as pool:
+            futures = {
+                pool.submit(_run_layers_1_to_3, item): item[0]
+                for item in enumerate(classifiers_and_dfs)
+            }
+            for future in as_completed(futures):
+                user_idx, df, results, llm_queue = future.result()
+                processed[user_idx] = (df, results, llm_queue)
+
+        # ── Phase 2: Collect & deduplicate LLM queue across ALL users ─────────
+        # Key insight: "AIRTIME PURCHASE MTN" from user A and user B have the
+        # same narration fingerprint → call LLM once, reuse for both.
+        unique_items: Dict[str, dict] = {}   # cache_key → representative item
+        # Per-user list of (item, cache_key) so we can fan results back later
+        user_key_lists: List[List[tuple]] = [[] for _ in range(n_users)]
+
+        for user_idx, (df, results, llm_queue) in enumerate(processed):
+            for item in llm_queue:
+                k = shared_cache._key(item["narration"], item["direction"])
+                user_key_lists[user_idx].append((item, k))
+                if k not in unique_items:
+                    unique_items[k] = item
+
+        # ── Phase 3: LLM — minimum possible API calls ─────────────────────────
+        llm_result_by_key: Dict[str, ClassifyResult] = {}
+
+        if unique_items and llm_enabled:
+            all_categories = sorted(ALL_CATEGORIES)
+            # Use first classifier's LLM config (all share same key/model)
+            llm_classifier = classifiers_and_dfs[0][0].llm
+            unique_list = list(unique_items.values())
+
+            for batch_start in range(0, len(unique_list), llm_classifier.batch_size):
+                batch = unique_list[batch_start:batch_start + llm_classifier.batch_size]
+                llm_results = llm_classifier.classify_batch(
+                    [{"narration": t["narration"], "amount": t["amount"],
+                      "direction": t["direction"], "date": t["date"]}
+                     for t in batch],
+                    all_categories,
+                )
+                for item, llm_result in zip(batch, llm_results):
+                    llm_result.counterparty = CounterpartyExtractor.extract(
+                        item["narration"]
+                    )
+                    k = shared_cache._key(item["narration"], item["direction"])
+                    llm_result_by_key[k] = llm_result
+                    # Populate shared cache so future requests skip LLM entirely
+                    shared_cache.set(item["narration"], item["direction"], llm_result)
+
+        # ── Phase 4: Fan LLM results back to every user's result list ─────────
+        output_dfs = []
+        for user_idx, (classifier, _) in enumerate(classifiers_and_dfs):
+            df, results, llm_queue = processed[user_idx]
+            result_map_idx = {idx: j for j, (idx, _) in enumerate(results)}
+
+            for item, k in user_key_lists[user_idx]:
+                llm_result = llm_result_by_key.get(k)
+                if llm_result is None:
+                    continue
+                df_idx = item["df_idx"]
+                j = result_map_idx.get(df_idx)
+                if j is not None and results[j][1] is None:
+                    results[j] = (df_idx, llm_result)
+                    if llm_result.source == ClassificationSource.LLM:
+                        classifier.stats["llm"] += 1
+                        classifier.stats["unclassified"] -= 1
+
+            # Write classification columns to the DataFrame
+            result_map = {idx: r for idx, r in results}
+            df["st_category"] = df.index.map(lambda i: result_map[i].category if result_map.get(i) else None)
+            df["st_type"] = df.index.map(lambda i: result_map[i].type if result_map.get(i) else None)
+            df["st_confidence"] = df.index.map(lambda i: result_map[i].confidence if result_map.get(i) else 0)
+            df["st_source"] = df.index.map(lambda i: result_map[i].source.value if result_map.get(i) else "unclassified")
+            df["st_needs_review"] = df.index.map(lambda i: result_map[i].needs_review if result_map.get(i) else True)
+            df["st_counterparty"] = df.index.map(lambda i: result_map[i].counterparty if result_map.get(i) else None)
+            df["st_explanation"] = df.index.map(lambda i: result_map[i].explanation if result_map.get(i) else "")
+            df["st_rule_hit"] = df.index.map(lambda i: result_map[i].rule_hit if result_map.get(i) else None)
+            output_dfs.append(df)
+
+        return output_dfs
 
 
 # ═══════════════════════════════════════════════════════════════
