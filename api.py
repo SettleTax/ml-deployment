@@ -16,6 +16,7 @@ Environment variables:
     LLM_PROVIDER        — "anthropic" (default) or "openai"
 """
 
+import math
 import os
 from typing import Optional, List, Dict
 
@@ -24,6 +25,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from settletax_classifier import SettleTaxClassifier, NarrationCache
+
+
+def _str_or_none(val) -> Optional[str]:
+    """Return None for NaN/None, otherwise the value as-is."""
+    if val is None:
+        return None
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    return val
 
 
 # Module-level shared cache — lives for the lifetime of the process.
@@ -230,14 +240,14 @@ def classify_batch(req: BatchRequest):
         results = []
         for _, row in result_df.iterrows():
             results.append(ClassifyResult(
-                category=row.get("st_category"),
+                category=_str_or_none(row.get("st_category")),
                 type=row.get("st_type") or "expense",
                 confidence=float(row.get("st_confidence") or 0),
                 source=row.get("st_source") or "unclassified",
                 needs_review=bool(row.get("st_needs_review", True)),
-                counterparty=row.get("st_counterparty"),
+                counterparty=_str_or_none(row.get("st_counterparty")),
                 explanation=row.get("st_explanation") or "",
-                rule_hit=row.get("st_rule_hit"),
+                rule_hit=_str_or_none(row.get("st_rule_hit")),
             ))
 
         return BatchResponse(results=results, stats=classifier.stats)
@@ -318,14 +328,14 @@ def classify_multi_user(
             results = []
             for _, row in result_df.iterrows():
                 results.append(ClassifyResult(
-                    category=row.get("st_category"),
+                    category=_str_or_none(row.get("st_category")),
                     type=row.get("st_type") or "expense",
                     confidence=float(row.get("st_confidence") or 0),
                     source=row.get("st_source") or "unclassified",
                     needs_review=bool(row.get("st_needs_review", True)),
-                    counterparty=row.get("st_counterparty"),
+                    counterparty=_str_or_none(row.get("st_counterparty")),
                     explanation=row.get("st_explanation") or "",
-                    rule_hit=row.get("st_rule_hit"),
+                    rule_hit=_str_or_none(row.get("st_rule_hit")),
                 ))
             user_results.append(UserBatchResult(
                 account_name=user.account_name,
