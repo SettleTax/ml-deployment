@@ -16,15 +16,32 @@ Environment variables:
     LLM_PROVIDER        — "anthropic" (default) or "openai"
 """
 
+import logging
 import math
 import os
 from typing import Optional, List, Dict
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("settletax")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from settletax_classifier import SettleTaxClassifier, NarrationCache
+
+
+def _log_summary(account_name: str, results: list):
+    from collections import Counter
+    source_counts = Counter(r.source for r in results)
+    needs_review_count = sum(1 for r in results if r.needs_review)
+    logger.info(
+        "[%s] total=%d | sources=%s | needs_review=%d",
+        account_name,
+        len(results),
+        dict(source_counts),
+        needs_review_count,
+    )
 
 
 def _str_or_none(val) -> Optional[str]:
@@ -250,6 +267,7 @@ def classify_batch(req: BatchRequest):
                 rule_hit=_str_or_none(row.get("st_rule_hit")),
             ))
 
+        _log_summary(req.account_name, results)
         return BatchResponse(results=results, stats=classifier.stats)
 
     except Exception as e:
@@ -337,6 +355,7 @@ def classify_multi_user(
                     explanation=row.get("st_explanation") or "",
                     rule_hit=_str_or_none(row.get("st_rule_hit")),
                 ))
+            _log_summary(user.account_name, results)
             user_results.append(UserBatchResult(
                 account_name=user.account_name,
                 results=results,
