@@ -144,6 +144,10 @@ class StructuralDetector:
         (r"MC\s+TRANSFER:\s*\S+\s+(.+?)$", "zenith"),
         # Moniepoint: "Transfer to {name} - {ref}"
         (r"TRANSFER\s+TO\s+(.+?)\s*-\s*\S+$", "moniepoint"),
+        # Paystack: "PAYSTACK - {merchant}" or "PAYSTACK PAYMENT TO {name}"
+        (r"PAYSTACK\s*[-:]\s*(.+?)(?:\s+\d|$)", "paystack"),
+        # OPay fallback: simpler "OPAY {name}" pattern
+        (r"OPAY\s+(.+?)(?:\s+\d|$)", "opay"),
     ]
 
     # Compiled provider patterns
