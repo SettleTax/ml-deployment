@@ -474,8 +474,11 @@ class StructuralDetector:
             # Account maintenance
             ("ACCOUNT MAINTENANCE", 0.99),
             ("ACCT MAINTENANCE", 0.99),
+            ("AMF", 0.99),
             ("MONTHLY MAINTENANCE", 0.99),
             ("QUARTERLY MAINTENANCE", 0.99),
+            ("ANNUAL MAINTENANCE", 0.99),
+            ("HALF YEARLY MAINTENANCE", 0.99),
             # Stamp duty
             ("STAMP DUTY", 0.99),
             ("STATUTORY STAMP DUTY", 0.99),
@@ -491,6 +494,7 @@ class StructuralDetector:
             ("E-MONEY TRANSFER LEVY", 0.99),
             ("ELECTRONIC TRANSFER LEVY", 0.99),
             # COT / commission on turnover
+            ("COT", 0.99),
             ("COT CHARGE", 0.99),
             ("COMMISSION ON TURNOVER", 0.99),
             ("COMMISSION CHARGE", 0.99),
@@ -498,7 +502,11 @@ class StructuralDetector:
             ("CARD MAINTENANCE", 0.95),
             ("CARD ISSUANCE", 0.95),
             ("CARD RENEWAL FEE", 0.95),
+            ("CARD LINKING FEE", 0.95),
             ("DEBIT CARD FEE", 0.95),
+            ("CREDIT CARD FEE", 0.95),
+            ("VISA CARD FEE", 0.95),
+            ("MASTERCARD FEE", 0.95),
             ("ATM CARD FEE", 0.95),
             ("ATM CHARGE", 0.95),
             ("ATM WITHDRAWAL FEE", 0.95),
@@ -511,11 +519,13 @@ class StructuralDetector:
             ("OVERDRAFT FEE", 0.95),
             ("OVERDRAFT INTEREST", 0.95),
             ("CREDIT FACILITY FEE", 0.95),
-            ("MANAGEMENT FEE", 0.95),
+            ("CREDIT LIFE INSURANCE", 0.95),
+            ("LIFE ASSURANCE PREMIUM", 0.95),
+            ("MANAGEMENT FEE", 0.75),
             # Transfer / transaction fees
             ("TRANSFER FEE", 0.95),
             ("TRANSACTION FEE", 0.95),
-            ("SERVICE CHARGE", 0.95),
+            ("SERVICE CHARGE", 0.75),
             ("HANDLING FEE", 0.95),
             ("PROCESSING FEE", 0.95),
             ("REVERSAL FEE", 0.95),
@@ -523,7 +533,25 @@ class StructuralDetector:
             ("RETURNED CHEQUE FEE", 0.95),
             ("CHEQUE BOOK", 0.95),
             ("CHEQUE PROCESSING", 0.95),
+            # Remittance / FX
+            ("REMITTANCE FEE", 0.95),
+            ("DOMICILIARY ACCOUNT FEE", 0.95),
+            ("FX PROCESSING FEE", 0.95),
+            # Regulatory levies
+            ("CYBERSECURITY LEVY", 0.99),
+            ("CBN CYBERSECURITY LEVY", 0.99),
+            ("CYBERSCURITY LEVY", 0.99),
+            ("NDIC PREMIUM", 0.99),
+            # Penalty charges
+            ("PENALTY FEE", 0.95),
+            ("LATE PAYMENT FEE", 0.95),
+            ("LATE PAYMENT CHARGE", 0.95),
+            ("DISHONOUR FEE", 0.95),
             # Other fees
+            ("ANNUAL FEE", 0.95),
+            ("SUBSCRIPTION FEE", 0.95),
+            ("REACTIVATION FEE", 0.95),
+            ("INDEMNITY FEE", 0.95),
             ("STATEMENT FEE", 0.95),
             ("SWIFT CHARGE", 0.95),
             ("FOREIGN TRANSFER FEE", 0.95),
@@ -546,8 +574,8 @@ class StructuralDetector:
                     rule_hit=f"bank_charge_{keyword.lower().replace(' ', '_')}",
                 )
 
-        # Amount-based heuristic: small debit (₦10-₦75) = likely NIP fee
-        if direction == "debit" and 10 <= amount <= 75:
+        # Amount-based heuristic: exact NIP fee amounts (₦10, ₦25, ₦50)
+        if direction == "debit" and amount in (10, 25, 50):
             if any(k in desc for k in ["NIP", "TRANSFER", "COMMISSION"]):
                 return ClassifyResult(
                     category="Bank Charges",
@@ -556,7 +584,7 @@ class StructuralDetector:
                     source=ClassificationSource.STRUCTURAL,
                     needs_review=False,
                     counterparty=None,
-                    explanation=f"Small debit (₦{amount}) with transfer keyword = NIP fee",
+                    explanation=f"Exact NIP fee amount (₦{amount}) with transfer keyword",
                     rule_hit="bank_charge_amount_nip",
                 )
 
@@ -574,20 +602,65 @@ class StructuralDetector:
                     rule_hit="bank_charge_sms",
                 )
 
+        # Stamp duty: bare ₦50 debit on credits above ₦10,000 (no keyword required)
+        if direction == "debit" and amount == 50:
+            return ClassifyResult(
+                category="Bank Charges",
+                type="expense",
+                confidence=0.85,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=False,
+                counterparty=None,
+                explanation="Likely stamp duty (₦50 flat debit)",
+                rule_hit="bank_charge_amount_stamp_duty",
+            )
+
+        # VAT on NIP fee: ₦1.25 or ₦3.75 bare debit
+        if direction == "debit" and amount in (1.25, 3.75):
+            return ClassifyResult(
+                category="Bank Charges",
+                type="expense",
+                confidence=0.85,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=False,
+                counterparty=None,
+                explanation=f"Likely VAT on NIP fee (₦{amount})",
+                rule_hit="bank_charge_amount_vat_nip",
+            )
+
+        # ATM withdrawal fee: exact ₦35 debit (after 3 free withdrawals)
+        if direction == "debit" and amount == 35:
+            if any(k in desc for k in ["ATM", "WITHDRAWAL", "CARD"]):
+                return ClassifyResult(
+                    category="Bank Charges",
+                    type="expense",
+                    confidence=0.90,
+                    source=ClassificationSource.STRUCTURAL,
+                    needs_review=False,
+                    counterparty=None,
+                    explanation="ATM withdrawal fee (₦35)",
+                    rule_hit="bank_charge_amount_atm",
+                )
+
         return None
 
-    def detect_reversal(self, narration: str) -> Optional[ClassifyResult]:
+    def detect_reversal(self, narration: str, direction: str) -> Optional[ClassifyResult]:
         """Detect failed/reversed transactions."""
         desc = narration.upper()
         reversal_keywords = [
             "REVERSAL", "REVERSED", "FAILED TRANSACTION",
-            "TRANSACTION FAILED", "REFUND", "CHARGEBACK",
+            "TRANSACTION FAILED", "FAILED TRANSFER", "TRANSFER FAILED",
+            "REFUND", "CHARGEBACK", "DISPUTE",
+            "RVS", "REV",
+            "UNSUCCESSFUL", "DECLINED", "BOUNCED",
+            "CLAWBACK", "RECALL", "RETURNED",
         ]
         for keyword in reversal_keywords:
             if keyword in desc:
+                tx_type = "income" if direction == "credit" else "expense"
                 return ClassifyResult(
                     category="Transfer",
-                    type="expense",
+                    type=tx_type,
                     confidence=0.90,
                     source=ClassificationSource.STRUCTURAL,
                     needs_review=True,  # user should verify
@@ -600,7 +673,14 @@ class StructuralDetector:
     def detect_atm(self, narration: str, direction: str) -> Optional[ClassifyResult]:
         """Detect ATM withdrawals."""
         desc = narration.upper()
-        if direction == "debit" and any(k in desc for k in ["ATM WITHDRAWAL", "ATM WDL", "ATM CASH"]):
+        if direction == "debit" and any(k in desc for k in [
+            "ATM WITHDRAWAL", "ATM CASH WITHDRAWAL", "ATM WDL", "ATM CASH",
+            "ATM TXN", "ATM TRANS", "ATM/WEB", "AUTOMATED TELLER",
+            "OFFUS ATM", "ONUS ATM", "INTERBANK ATM",
+            "CASH WITHDRAWAL", "WDL",
+            "POS CASH", "CASHBACK",
+            "AGENT CASH OUT", "CASH OUT",
+        ]):
             return ClassifyResult(
                 category="Drawings",
                 type="expense",
@@ -621,7 +701,7 @@ class StructuralDetector:
         Priority: reversal > bank charge > ATM > self-transfer
         """
         # 1. Reversals first (they override everything)
-        result = self.detect_reversal(narration)
+        result = self.detect_reversal(narration, direction)
         if result:
             return result
 
@@ -638,12 +718,22 @@ class StructuralDetector:
         # 4. Self-transfer detection
         is_self, score, best_span = self.detect_self_transfer(narration)
         if is_self:
+            tx_type = "income" if direction == "credit" else "expense"
+            # Scale boost by score band to avoid over-inflating weak matches
+            if score >= 0.60:
+                confidence = min(score + 0.20, 0.98)
+            elif score >= 0.40:
+                confidence = min(score + 0.12, 0.98)
+            else:
+                confidence = min(score + 0.05, 0.98)
+            # Flag for review: weak matches OR full-narration/substring fallback spans
+            needs_review = score < 0.50 or best_span in ("substring_match", "full_narration")
             return ClassifyResult(
                 category="Transfer",
-                type="expense",
-                confidence=min(score + 0.20, 0.98),
+                type=tx_type,
+                confidence=confidence,
                 source=ClassificationSource.STRUCTURAL,
-                needs_review=score < 0.40,
+                needs_review=needs_review,
                 counterparty=best_span,
                 explanation=f"Self-transfer detected (n-gram score: {score:.3f}, span: '{best_span}')",
                 rule_hit="self_transfer",
