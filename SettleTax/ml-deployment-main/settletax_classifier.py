@@ -1091,6 +1091,249 @@ class RuleEngine:
 
         # ═══ SALARIES (EXPENSE — paying employees) ═══
         Rule(["SALARY TO ", "STAFF SALARY", "EMPLOYEE SALARY"], "Salaries and Wages", "expense", 0.88, "salary_out", direction="debit"),
+        Rule(["WAGES PAYMENT", "WAGE PAYMENT"], "Salaries and Wages", "expense", 0.88, "wages_out", direction="debit"),
+        Rule(["CONTRACTOR PAYMENT", "FREELANCER PAYMENT"], "Legal and Professional Fees", "expense", 0.80, "contractor_payment", direction="debit"),
+        Rule(["NANNY SALARY", "DRIVER SALARY", "GATEMAN SALARY", "DOMESTIC STAFF"], "Drawings", "expense", 0.85, "personal_staff", direction="debit"),
+
+        # ═══ TAX PAYMENTS — STATE REVENUE SERVICES ═══
+        Rule(["RIVERS STATE INTERNAL REVENUE", "RIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_rirs"),
+        Rule(["OGUN STATE INTERNAL REVENUE", "OGSIRS"], "PAYE Income", "expense", 0.97, "tax_ogsirs"),
+        Rule(["KANO STATE INTERNAL REVENUE", "KIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_kirs"),
+        Rule(["ANAMBRA INTERNAL REVENUE", "AIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_airs"),
+        Rule(["DELTA STATE INTERNAL REVENUE"], "PAYE Income", "expense", 0.97, "tax_delta"),
+        Rule(["BUSINESS PREMISES LEVY"], "PAYE Income", "expense", 0.90, "tax_bpl"),
+        Rule(["DEVELOPMENT LEVY"], "PAYE Income", "expense", 0.88, "tax_dev_levy"),
+        Rule(["CAPITAL GAINS TAX", "CGT PAYMENT"], "Capital Gains Income", "expense", 0.93, "tax_cgt"),
+        Rule(["STAMP DUTIES PAYMENT", "STAMP DUTY PAYMENT"], "PAYE Income", "expense", 0.90, "tax_stamp_duties",
+             exclude_keywords=["STAMP DUTY"]),
+
+        # ═══ RELIEFS — PFAs ═══
+        Rule(["ARM PENSION"], "Pension", "expense", 0.96, "relief_arm_pension"),
+        Rule(["STANBIC IBTC PENSION"], "Pension", "expense", 0.96, "relief_stanbic_pension"),
+        Rule(["AIICO PENSION"], "Pension", "expense", 0.96, "relief_aiico_pension"),
+        Rule(["PREMIUM PENSION"], "Pension", "expense", 0.96, "relief_premium_pension"),
+        Rule(["CRUSADER STERLING PENSION"], "Pension", "expense", 0.96, "relief_crusader_pension"),
+        Rule(["LEADWAY PENSURE"], "Pension", "expense", 0.96, "relief_leadway_pension"),
+        Rule(["PAL PENSIONS"], "Pension", "expense", 0.96, "relief_pal_pension"),
+        Rule(["NSITF", "EMPLOYEES COMPENSATION"], "PAYE Income", "expense", 0.93, "relief_nsitf"),
+
+        # ═══ RELIEFS — HMOs ═══
+        Rule(["HYGEIA HMO", "HYGEIA"], "Health Insurance", "expense", 0.93, "hmo_hygeia"),
+        Rule(["TOTAL HEALTH TRUST", "THT HMO"], "Health Insurance", "expense", 0.93, "hmo_tht"),
+        Rule(["RELIANCE HMO"], "Health Insurance", "expense", 0.93, "hmo_reliance"),
+        Rule(["AVON HMO"], "Health Insurance", "expense", 0.93, "hmo_avon"),
+        Rule(["CLEARLINE HMO"], "Health Insurance", "expense", 0.93, "hmo_clearline"),
+
+        # ═══ UTILITIES — ELECTRICITY (MISSING DISCOs) ═══
+        Rule(["KANO ELECTRICITY", "KEDCO"], "Utilities", "expense", 0.96, "util_kedco"),
+        Rule(["YOLA ELECTRICITY", "YEDC"], "Utilities", "expense", 0.96, "util_yedc"),
+        Rule(["SOKOTO ELECTRICITY", "SEDCO"], "Utilities", "expense", 0.96, "util_sedco"),
+        Rule(["NEPA", "PHCN"], "Utilities", "expense", 0.88, "util_nepa_legacy"),
+        Rule(["PREPAID TOKEN"], "Utilities", "expense", 0.90, "util_prepaid_token"),
+
+        # ═══ UTILITIES — INTERNET/BROADBAND ═══
+        Rule(["SPECTRANET"], "Telephone", "expense", 0.93, "isp_spectranet"),
+        Rule(["SMILE NETWORK", "SMILE COMMUNICATIONS"], "Telephone", "expense", 0.93, "isp_smile"),
+        Rule(["IPNX"], "Telephone", "expense", 0.93, "isp_ipnx"),
+        Rule(["SWIFT NETWORKS"], "Telephone", "expense", 0.93, "isp_swift"),
+        Rule(["COOLLINK"], "Telephone", "expense", 0.93, "isp_coollink"),
+        Rule(["NTEL"], "Telephone", "expense", 0.88, "tel_ntel"),
+        Rule(["BROADBAND", "FIBRE SUBSCRIPTION", "FIBER SUBSCRIPTION"], "Telephone", "expense", 0.88, "isp_generic"),
+
+        # ═══ FUEL — MISSING STATIONS ═══
+        Rule(["MRS OIL", "MRS PETROLEUM"], "Fuel", "expense", 0.93, "fuel_mrs"),
+        Rule(["NIPCO"], "Fuel", "expense", 0.93, "fuel_nipco"),
+        Rule(["11 PLC", "11PLC"], "Fuel", "expense", 0.93, "fuel_11plc"),
+        Rule(["HEYDEN PETROLEUM"], "Fuel", "expense", 0.93, "fuel_heyden"),
+        Rule(["RAINOIL"], "Fuel", "expense", 0.93, "fuel_rainoil"),
+        Rule(["A-Z PETROLEUM"], "Fuel", "expense", 0.93, "fuel_az"),
+        Rule(["GENERATOR FUEL", "GENERATOR DIESEL", "DIESEL FOR GENERATOR"], "Fuel", "expense", 0.90, "fuel_generator"),
+
+        # ═══ TRANSPORT — RIDE HAILING / TRAVEL ═══
+        Rule(["SHUTTLERS"], "Motor Running Expenses", "expense", 0.88, "transport_shuttlers"),
+        Rule(["LAGRIDE"], "Motor Running Expenses", "expense", 0.88, "transport_lagride"),
+        Rule(["BRT PAYMENT", "COWRY CARD"], "Motor Running Expenses", "expense", 0.88, "transport_brt"),
+        Rule(["VEHICLE REPAIR", "CAR SERVICE", "PANEL BEATING", "TYRE PURCHASE"], "Motor Running Expenses", "expense", 0.85, "transport_vehicle_repair"),
+        Rule(["AIR PEACE"], "Travel Expenses", "expense", 0.90, "travel_airpeace"),
+        Rule(["ARIK AIR"], "Travel Expenses", "expense", 0.90, "travel_arik"),
+        Rule(["DANA AIR"], "Travel Expenses", "expense", 0.90, "travel_dana"),
+        Rule(["UNITED AIRLINES"], "Travel Expenses", "expense", 0.90, "travel_united"),
+        Rule(["ETHIOPIAN AIRLINES"], "Travel Expenses", "expense", 0.90, "travel_ethiopian"),
+        Rule(["FLIGHT TICKET", "AIRLINE TICKET", "AVIATION FUEL"], "Travel Expenses", "expense", 0.88, "travel_flight_generic"),
+        Rule(["NIGERIAN RAILWAY", "NRC TICKET"], "Travel Expenses", "expense", 0.88, "travel_rail"),
+        Rule(["HOTEL", "LODGING", "ACCOMMODATION"], "Travel Expenses", "expense", 0.80, "travel_hotel", direction="debit"),
+
+        # ═══ RENT — ADDITIONAL ═══
+        Rule(["GROUND RENT"], "Annual Rent", "expense", 0.85, "rent_ground", direction="debit"),
+        Rule(["FACILITY MANAGEMENT"], "Repairs and Maintenance", "expense", 0.80, "rent_facility_mgmt", direction="debit"),
+        Rule(["LAND USE CHARGE", "LAND CHARGE"], "Legal and Professional Fees", "expense", 0.85, "legal_land_charge"),
+        Rule(["CERTIFICATE OF OCCUPANCY", "C OF O"], "Legal and Professional Fees", "expense", 0.88, "legal_coo"),
+
+        # ═══ SALARY / EMPLOYMENT INCOME — ADDITIONAL ═══
+        Rule(["THIRTEENTH MONTH", "13TH MONTH"], "Income", "income", 0.90, "salary_13th", direction="credit"),
+        Rule(["LEAVE ALLOWANCE", "LEAVE BONUS"], "Income", "income", 0.90, "salary_leave", direction="credit"),
+        Rule(["BONUS PAYMENT", "PERFORMANCE BONUS"], "Income", "income", 0.88, "salary_bonus", direction="credit"),
+        Rule(["GRATUITY PAYMENT"], "Income", "income", 0.88, "salary_gratuity", direction="credit"),
+        Rule(["SEVERANCE PAY", "REDUNDANCY PAY"], "Income", "income", 0.88, "salary_severance", direction="credit"),
+        Rule(["NYSC ALLOWANCE"], "Income", "income", 0.90, "income_nysc", direction="credit"),
+
+        # ═══ BUSINESS INCOME — ADDITIONAL ═══
+        Rule(["RETAINER FEE", "RETAINER PAYMENT"], "Consulting Income", "income", 0.88, "income_retainer", direction="credit"),
+        Rule(["PROFESSIONAL FEE"], "Consulting Income", "income", 0.85, "income_professional_fee", direction="credit"),
+        Rule(["ROYALTY PAYMENT", "ROYALTY CREDIT"], "Income", "income", 0.85, "income_royalty", direction="credit"),
+        Rule(["DIVIDEND PAYMENT", "DIVIDEND CREDIT", "DIV PAYMENT"], "Dividend Income", "income", 0.93, "income_dividend", direction="credit"),
+        Rule(["STANBIC IBTC NOMINEES", "MERISTEM", "CORONATION SECURITIES"], "Dividend Income", "income", 0.88, "income_dividend_broker", direction="credit"),
+
+        # ═══ DRAWINGS — FOOD / PERSONAL (ADDITIONAL) ═══
+        Rule(["PIZZA HUT"], "Drawings", "expense", 0.90, "personal_pizzahut"),
+        Rule(["BURGER KING"], "Drawings", "expense", 0.90, "personal_burgerking"),
+        Rule(["SUBWAY"], "Drawings", "expense", 0.88, "personal_subway"),
+        Rule(["DEBONAIRS"], "Drawings", "expense", 0.90, "personal_debonairs"),
+        Rule(["TASTEE FRIED CHICKEN", "TFC"], "Drawings", "expense", 0.88, "personal_tfc"),
+        Rule(["BARCELOS"], "Drawings", "expense", 0.90, "personal_barcelos"),
+        Rule(["CRUNCHIES"], "Drawings", "expense", 0.88, "personal_crunchies"),
+        Rule(["CAFE NEO"], "Drawings", "expense", 0.88, "personal_cafneo"),
+        Rule(["MORNING SIDE CAFE", "MORNINGSIDE"], "Drawings", "expense", 0.88, "personal_morningside"),
+        Rule(["PRINCE EBEANO"], "Drawings", "expense", 0.88, "personal_ebeano"),
+        Rule(["HUBMART"], "Drawings", "expense", 0.88, "personal_hubmart"),
+        Rule(["NEXT SUPERMARKET"], "Drawings", "expense", 0.88, "personal_next_supermarket"),
+        Rule(["MARKET SQUARE"], "Drawings", "expense", 0.85, "personal_market_square"),
+        Rule(["HEALTH PLUS PHARMACY", "HEALTH PLUS"], "Drawings", "expense", 0.85, "personal_healthplus"),
+        Rule(["MED PLUS", "MEDPLUS"], "Drawings", "expense", 0.85, "personal_medplus"),
+        Rule(["ALPHA PHARMACY"], "Drawings", "expense", 0.85, "personal_alpha_pharmacy"),
+
+        # ═══ STREAMING / ENTERTAINMENT (ADDITIONAL) ═══
+        Rule(["AUDIOMACK"], "Drawings", "expense", 0.90, "personal_audiomack"),
+        Rule(["BOOMPLAY"], "Drawings", "expense", 0.90, "personal_boomplay"),
+        Rule(["CANAL PLUS", "CANAL+"], "Utilities", "expense", 0.90, "util_canalplus"),
+        Rule(["DISNEY PLUS", "DISNEY+"], "Drawings", "expense", 0.88, "personal_disney"),
+        Rule(["APPLE TV"], "Drawings", "expense", 0.88, "personal_appletv"),
+        Rule(["BET9JA", "SPORTYBET", "1XBET", "NAIRABET"], "Drawings", "expense", 0.75, "personal_betting",
+             direction="debit"),
+
+        # ═══ ONLINE SHOPPING (ADDITIONAL) ═══
+        Rule(["AMAZON"], "Drawings", "expense", 0.75, "personal_amazon_shop", direction="debit",
+             exclude_keywords=["AMAZON PRIME", "AMAZON WEB"]),
+        Rule(["ALIEXPRESS"], "Drawings", "expense", 0.80, "personal_aliexpress", direction="debit"),
+        Rule(["JIJI"], "Drawings", "expense", 0.75, "personal_jiji", direction="debit"),
+
+        # ═══ INVESTMENTS (ADDITIONAL) ═══
+        Rule(["WEALTH.NG", "WEALTHNG"], "Investment Income", "income", 0.82, "invest_wealthng", direction="credit"),
+        Rule(["AFRINVEST"], "Investment Income", "income", 0.82, "invest_afrinvest", direction="credit"),
+        Rule(["STANBIC IBTC ASSET"], "Investment Income", "income", 0.82, "invest_stanbic_asset", direction="credit"),
+        Rule(["ARM INVESTMENT", "ARM FUNDS"], "Investment Income", "income", 0.82, "invest_arm", direction="credit"),
+        Rule(["NORRENBERGER"], "Investment Income", "income", 0.80, "invest_norrenberger", direction="credit"),
+        Rule(["TREASURY BILL", "TBILL", "T-BILL"], "Investment Income", "income", 0.88, "invest_tbill_in", direction="credit"),
+        Rule(["FGN BOND", "FGN SAVINGS BOND"], "Investment Income", "income", 0.90, "invest_fgn_bond_in", direction="credit"),
+        Rule(["FIXED DEPOSIT", "TERM DEPOSIT"], "Investment Income", "income", 0.85, "invest_fixed_deposit", direction="credit"),
+        Rule(["TREASURY BILL", "TBILL", "T-BILL"], "Drawings", "expense", 0.85, "invest_tbill_out", direction="debit"),
+        Rule(["FGN BOND", "FGN SAVINGS BOND"], "Drawings", "expense", 0.85, "invest_fgn_bond_out", direction="debit"),
+        Rule(["FIXED DEPOSIT PLACEMENT", "TERM DEPOSIT PLACEMENT"], "Drawings", "expense", 0.85, "invest_fd_out", direction="debit"),
+
+        # ═══ CRYPTO (ADDITIONAL) ═══
+        Rule(["NOONES"], "Crypto Trading Income", "income", 0.78, "crypto_noones_in", direction="credit"),
+        Rule(["YELLOW CARD"], "Crypto Trading Income", "income", 0.78, "crypto_yellowcard_in", direction="credit"),
+        Rule(["OBIEX"], "Crypto Trading Income", "income", 0.78, "crypto_obiex_in", direction="credit"),
+        Rule(["BUYCOINS"], "Crypto Trading Income", "income", 0.78, "crypto_buycoins_in", direction="credit"),
+        Rule(["NOONES"], "Crypto Trading Cost", "expense", 0.78, "crypto_noones_out", direction="debit"),
+        Rule(["YELLOW CARD"], "Crypto Trading Cost", "expense", 0.78, "crypto_yellowcard_out", direction="debit"),
+        Rule(["OBIEX"], "Crypto Trading Cost", "expense", 0.78, "crypto_obiex_out", direction="debit"),
+        Rule(["BUYCOINS"], "Crypto Trading Cost", "expense", 0.78, "crypto_buycoins_out", direction="debit"),
+
+        # ═══ INSURANCE (ADDITIONAL) ═══
+        Rule(["MUTUAL BENEFITS"], "Insurance", "expense", 0.93, "insurance_mutual"),
+        Rule(["NEM INSURANCE"], "Insurance", "expense", 0.93, "insurance_nem"),
+        Rule(["SOVEREIGN TRUST"], "Insurance", "expense", 0.93, "insurance_sovereign"),
+        Rule(["ZENITH INSURANCE"], "Insurance", "expense", 0.93, "insurance_zenith"),
+        Rule(["CONSOLIDATED HALLMARK"], "Insurance", "expense", 0.93, "insurance_hallmark"),
+        Rule(["REGENCY ALLIANCE"], "Insurance", "expense", 0.93, "insurance_regency"),
+        Rule(["MOTOR INSURANCE", "COMPREHENSIVE INSURANCE", "THIRD PARTY INSURANCE"], "Insurance", "expense", 0.90, "insurance_motor"),
+        Rule(["HEALTH INSURANCE PREMIUM"], "Health Insurance", "expense", 0.93, "insurance_health_premium"),
+
+        # ═══ GOVERNMENT / LEGAL (ADDITIONAL) ═══
+        Rule(["NAFDAC"], "Legal and Professional Fees", "expense", 0.88, "legal_nafdac"),
+        Rule(["NIPC", "NOTAP"], "Legal and Professional Fees", "expense", 0.88, "legal_nipc"),
+        Rule(["TRADEMARK REGISTRATION", "PATENT FEE"], "Legal and Professional Fees", "expense", 0.88, "legal_trademark"),
+        Rule(["NOTARY FEE"], "Legal and Professional Fees", "expense", 0.88, "legal_notary"),
+
+        # ═══ EDUCATION (ADDITIONAL) ═══
+        Rule(["STUDY ABROAD", "INTERNATIONAL SCHOOL"], "Training", "expense", 0.82, "edu_international"),
+        Rule(["PROFESSIONAL CERTIFICATION", "CFA", "ACCA", "ICAN FEE", "CITN", "CIBN"], "Training", "expense", 0.88, "edu_professional_cert"),
+        Rule(["COURSERA"], "Training", "expense", 0.88, "edu_coursera"),
+        Rule(["UDEMY"], "Training", "expense", 0.88, "edu_udemy"),
+        Rule(["LINKEDIN LEARNING"], "Training", "expense", 0.88, "edu_linkedin_learning"),
+
+        # ═══ SOFTWARE SUBSCRIPTIONS (ADDITIONAL) ═══
+        Rule(["GITHUB"], "Subscriptions", "expense", 0.90, "sub_github"),
+        Rule(["GITLAB"], "Subscriptions", "expense", 0.90, "sub_gitlab"),
+        Rule(["FIGMA"], "Subscriptions", "expense", 0.90, "sub_figma"),
+        Rule(["HUBSPOT"], "Subscriptions", "expense", 0.88, "sub_hubspot"),
+        Rule(["SALESFORCE"], "Subscriptions", "expense", 0.88, "sub_salesforce"),
+        Rule(["MAILCHIMP"], "Subscriptions", "expense", 0.88, "sub_mailchimp"),
+        Rule(["SENDGRID"], "Subscriptions", "expense", 0.88, "sub_sendgrid"),
+        Rule(["AWS", "AMAZON WEB SERVICES"], "Subscriptions", "expense", 0.88, "sub_aws"),
+        Rule(["GOOGLE CLOUD"], "Subscriptions", "expense", 0.88, "sub_gcloud"),
+        Rule(["MICROSOFT AZURE", "AZURE SUBSCRIPTION"], "Subscriptions", "expense", 0.88, "sub_azure"),
+        Rule(["SHOPIFY"], "Subscriptions", "expense", 0.88, "sub_shopify"),
+        Rule(["ATLASSIAN", "JIRA"], "Subscriptions", "expense", 0.88, "sub_atlassian"),
+        Rule(["DROPBOX"], "Subscriptions", "expense", 0.88, "sub_dropbox"),
+        Rule(["INTERCOM"], "Subscriptions", "expense", 0.88, "sub_intercom"),
+        Rule(["ZENDESK"], "Subscriptions", "expense", 0.88, "sub_zendesk"),
+
+        # ═══ ADVERTISING ═══
+        Rule(["GOOGLE ADS", "GOOGLE ADWORDS"], "Advertising", "expense", 0.93, "ads_google"),
+        Rule(["FACEBOOK ADS", "META ADS"], "Advertising", "expense", 0.93, "ads_facebook"),
+        Rule(["INSTAGRAM ADS"], "Advertising", "expense", 0.93, "ads_instagram"),
+        Rule(["TWITTER ADS", "X ADS"], "Advertising", "expense", 0.90, "ads_twitter"),
+        Rule(["TIKTOK ADS", "TIKTOK FOR BUSINESS"], "Advertising", "expense", 0.90, "ads_tiktok"),
+        Rule(["INFLUENCER PAYMENT"], "Advertising", "expense", 0.80, "ads_influencer", direction="debit"),
+
+        # ═══ REPAIRS AND MAINTENANCE ═══
+        Rule(["GENERATOR REPAIR", "GENERATOR MAINTENANCE", "GENERATOR SERVICE"], "Repairs and Maintenance", "expense", 0.88, "repair_generator"),
+        Rule(["AC REPAIR", "AIR CONDITION REPAIR", "HVAC"], "Repairs and Maintenance", "expense", 0.88, "repair_ac"),
+        Rule(["PLUMBER", "PLUMBING"], "Repairs and Maintenance", "expense", 0.85, "repair_plumbing"),
+        Rule(["ELECTRICIAN"], "Repairs and Maintenance", "expense", 0.82, "repair_electrician", direction="debit"),
+        Rule(["BUILDING REPAIR", "PROPERTY MAINTENANCE", "PROPERTY REPAIR"], "Repairs and Maintenance", "expense", 0.85, "repair_building"),
+
+        # ═══ STATIONERY ═══
+        Rule(["OFFICE SUPPLIES", "STATIONERY PURCHASE"], "Stationery", "expense", 0.85, "stat_generic"),
+        Rule(["PRINTOUT", "PRINTING"], "Stationery", "expense", 0.80, "stat_printing", direction="debit"),
+        Rule(["TONER", "INK CARTRIDGE", "PRINTER INK"], "Stationery", "expense", 0.88, "stat_toner"),
+        Rule(["PAPER PURCHASE", "REAMS OF PAPER"], "Stationery", "expense", 0.85, "stat_paper"),
+
+        # ═══ OFFICE EQUIPMENT ═══
+        Rule(["FURNITURE PURCHASE", "OFFICE FURNITURE"], "Office Equipment", "expense", 0.85, "equip_furniture"),
+        Rule(["GENERATOR PURCHASE"], "Office Equipment", "expense", 0.85, "equip_generator"),
+        Rule(["AC UNIT", "AIR CONDITIONER PURCHASE"], "Office Equipment", "expense", 0.85, "equip_ac"),
+        Rule(["OFFICE CHAIR", "OFFICE TABLE", "OFFICE DESK"], "Office Equipment", "expense", 0.85, "equip_office_furniture"),
+
+        # ═══ COMPUTER EQUIPMENT ═══
+        Rule(["LAPTOP PURCHASE", "LAPTOP"], "Computer Equipment", "expense", 0.82, "it_laptop", direction="debit"),
+        Rule(["APPLE STORE"], "Computer Equipment", "expense", 0.82, "it_apple_store", direction="debit"),
+        Rule(["DELL", "HP LAPTOP", "LENOVO", "MACBOOK"], "Computer Equipment", "expense", 0.80, "it_laptop_brand", direction="debit"),
+        Rule(["IPHONE PURCHASE", "SAMSUNG PURCHASE"], "Computer Equipment", "expense", 0.78, "it_phone", direction="debit"),
+
+        # ═══ DONATIONS ═══
+        Rule(["DONATION", "CHARITABLE DONATION"], "Donations", "expense", 0.85, "donation_generic", direction="debit"),
+        Rule(["TITHE", "OFFERING"], "Donations", "expense", 0.82, "donation_tithe", direction="debit"),
+        Rule(["CHURCH PAYMENT", "MOSQUE PAYMENT"], "Donations", "expense", 0.78, "donation_worship", direction="debit"),
+        Rule(["ZAKAT"], "Donations", "expense", 0.88, "donation_zakat", direction="debit"),
+
+        # ═══ LOAN PLATFORMS (ADDITIONAL) ═══
+        Rule(["AELLA CREDIT", "AELLA"], "Interest on Loans", "expense", 0.82, "loan_aella", direction="debit"),
+        Rule(["KUDA LOAN"], "Interest on Loans", "expense", 0.82, "loan_kuda", direction="debit"),
+        Rule(["OPAY LOAN"], "Interest on Loans", "expense", 0.82, "loan_opay", direction="debit"),
+        Rule(["MIGO"], "Interest on Loans", "expense", 0.80, "loan_migo", direction="debit"),
+        Rule(["QUICKCHECK"], "Interest on Loans", "expense", 0.80, "loan_quickcheck", direction="debit"),
+        Rule(["CREDITVILLE"], "Interest on Loans", "expense", 0.80, "loan_creditville", direction="debit"),
+        Rule(["SPECTA"], "Interest on Loans", "expense", 0.80, "loan_specta", direction="debit"),
+        Rule(["NIRSAL MFB", "NIRSAL LOAN"], "Interest on Loans", "expense", 0.82, "loan_nirsal", direction="debit"),
+        Rule(["BOI LOAN", "BANK OF INDUSTRY"], "Interest on Loans", "expense", 0.82, "loan_boi", direction="debit"),
+        Rule(["CBN LOAN", "CBN INTERVENTION"], "Income", "income", 0.78, "loan_cbn_in", direction="credit"),
+
+        # ═══ CAPITAL GAINS ═══
+        Rule(["CAPITAL GAIN", "ASSET SALE PROCEED", "PROPERTY SALE PROCEED"], "Capital Gains Income", "income", 0.82, "capgain_income", direction="credit"),
+        Rule(["ASSET PURCHASE", "PROPERTY PURCHASE"], "Capital Gains Cost", "expense", 0.80, "capgain_cost", direction="debit"),
     ]
 
     def classify(
@@ -1131,11 +1374,13 @@ class LLMClassifier:
         model: str = "claude-sonnet-4-20250514",
         provider: str = "anthropic",  # "anthropic" or "openai"
         batch_size: int = 20,
+        account_name: str = "",
     ):
         self.api_key = api_key
         self.model = model
         self.provider = provider
         self.batch_size = batch_size
+        self.account_name = account_name
 
     def _build_prompt(
         self, transactions: List[dict], category_labels: List[str]
@@ -1150,7 +1395,15 @@ class LLMClassifier:
                 f"\"{tx['narration']}\""
             )
 
+        account_context = (
+            f"Account holder: {self.account_name}\n"
+            f"Any transaction where the counterparty name closely matches \"{self.account_name}\" is a Transfer, not Income or Drawings."
+            if self.account_name else
+            "Account holder name not provided."
+        )
+
         return f"""You are classifying Nigerian bank transactions for a tax application called SettleTax.
+The account holder is a Nigerian individual or business. All transactions are in Nigerian Naira (NGN).
 
 For each transaction, assign:
 1. "category" — MUST be one of these exact labels: {json.dumps(category_labels)}
@@ -1158,21 +1411,176 @@ For each transaction, assign:
 3. "confidence" — 0.0 to 1.0 (how sure you are)
 4. "explanation" — brief reason (under 15 words)
 
-Context:
-- These are Nigerian Naira (NGN) transactions from bank statements
-- DEBIT = money leaving the account (expense/transfer)
-- CREDIT = money entering the account (income/transfer)
-- "Drawings" = personal/non-business expenses
-- "Transfer" = money moving between the user's own accounts
-- "Income" = general business/employment income
-- If a transaction mentions a person's name with no other context, it's likely a "Transfer"
-- Small debits right after transfers are usually "Bank Charges"
+\u2550\u2550\u2550 ACCOUNT HOLDER \u2550\u2550\u2550
+{account_context}
+
+\u2550\u2550\u2550 DIRECTION RULES \u2550\u2550\u2550
+- DEBIT = money leaving the account \u2192 usually "expense" or "Transfer"
+- CREDIT = money entering the account \u2192 usually "income" or "Transfer"
+
+\u2550\u2550\u2550 TRANSFER vs INCOME vs DRAWINGS \u2550\u2550\u2550
+- Transfer: ONLY when money moves between the SAME person's own accounts (same owner, different banks)
+- If money comes FROM a business or employer \u2192 Income
+- If money goes TO a vendor, merchant, or service \u2192 the appropriate expense category
+- If money goes TO a person for a service rendered \u2192 Legal and Professional Fees or Salaries and Wages
+- If money goes TO a person with no clear purpose \u2192 Transfer (flag for review, confidence \u2264 0.65)
+- Inter-bank NIP transfers to/from a person's name only \u2192 Transfer at low confidence (\u2264 0.65)
+
+\u2550\u2550\u2550 INCOME SUBCATEGORY RULES \u2550\u2550\u2550
+- "Income" \u2192 regular salary, wages, or general business revenue (use when unsure between income types)
+- "PAYE Income" \u2192 ONLY for tax deductions paid to FIRS/state revenue \u2014 ALWAYS expense, never income
+- "Consulting Income" \u2192 one-off professional fees, freelance payments, retainers received
+- "Commission Income" \u2192 sales commission received
+- "Dividend Income" \u2192 dividend payments from shares/stocks
+- "Investment Income" \u2192 returns/withdrawals from investment platforms (Risevest, Cowrywise, etc.)
+- "Bank Interest Received" \u2192 interest credited by the bank on savings or fixed deposit
+- "Annual Rent" (income) \u2192 rent received from a tenant \u2014 credit direction only
+- If a credit narration mentions a company name + PAYMENT or SALARY \u2192 Income
+- If a credit mentions INTEREST \u2192 Bank Interest Received
+- If a credit mentions DIVIDEND \u2192 Dividend Income
+
+\u2550\u2550\u2550 EXPENSE SUBCATEGORY RULES \u2550\u2550\u2550
+- "Motor Running Expenses" \u2192 vehicle running costs: ride-hailing, vehicle repairs, tyres, road worthiness
+- "Repairs and Maintenance" \u2192 building/property/equipment repairs (NOT vehicle)
+- "Office Equipment" \u2192 one-off purchase of physical office items (furniture, generator, AC unit)
+- "Computer Equipment" \u2192 laptops, phones, tablets, IT hardware
+- "Stationery" \u2192 consumable office supplies: paper, ink, printing
+- "Subscriptions" \u2192 recurring software/platform fees (GitHub, Zoom, Shopify, AWS, Canva)
+- "Advertising" \u2192 paid digital or print ads (Google Ads, Facebook Ads, influencer payments)
+- "Legal and Professional Fees" \u2192 lawyers, accountants, CAC, NAFDAC, trademark, notary fees
+- "Training" \u2192 school fees, exams (WAEC/JAMB/ICAN/ACCA), courses, certifications
+- "Donations" \u2192 tithe, offering, zakat, charitable payments
+- "Drawings" \u2192 personal spending NOT related to business (food, personal shopping, streaming, betting)
+- "Bank Charges" \u2192 any fee charged BY the bank (NIP fee, stamp duty, VAT on transfer, card fee, SMS alert)
+- "Interest on Loans" \u2192 loan repayments to any lender (bank or fintech)
+- "Pension" \u2192 pension contributions to a PFA
+- "National Housing Fund" \u2192 NHF contributions only
+- "Health Insurance" \u2192 NHIS or HMO premium payments
+- "Life Assurance Premium" \u2192 life insurance payments (AIICO, AXA Mansard, Leadway life products)
+
+\u2550\u2550\u2550 NIGERIAN MERCHANT CONTEXT \u2550\u2550\u2550
+Electricity: IKEDC/Ikeja Electric, EKEDC/Eko Electric, IBEDC, AEDC, EEDC, BEDC, KEDCO, PHEDC, NEPA, PHCN \u2192 Utilities
+Cable TV: DSTV, GOtv, StarTimes, Multichoice \u2192 Utilities (NOT Subscriptions)
+Fuel stations: Oando, Total Energies, MRS Oil, Conoil, Ardova, Nipco, 11 PLC \u2192 Fuel
+Ride-hailing: Bolt, Uber, InDrive, LagRide \u2192 Motor Running Expenses
+Telecom/ISP: MTN, Glo, Airtel, 9mobile, Spectranet, Smile, IPNX \u2192 Telephone
+Exam bodies: WAEC, JAMB, NECO \u2192 Training
+Tax agencies: FIRS, LIRS, RIRS, OGSIRS, KIRS and all state internal revenue services \u2192 PAYE Income (expense)
+Insurance: AIICO, AXA Mansard, Leadway, Custodian, Heirs, NEM, Sovereign Trust \u2192 Insurance or Life Assurance Premium
+Pension: ARM Pension, Stanbic IBTC Pension, Premium Pension, AIICO Pension, PAL Pensions \u2192 Pension
+Lending apps: Carbon, Fairmoney, Branch, Renmoney, PalmCredit, Aella, Migo, Specta \u2192 Interest on Loans (debit)
+Investment apps: Risevest, Cowrywise, PiggyVest, Bamboo, Trove, Chaka, Wealth.ng \u2192 Investment Income (credit) / Drawings (debit)
+Crypto platforms: Binance, Luno, Quidax, Bybit, Yellow Card, Obiex, Noones \u2192 Crypto Trading Income (credit) / Crypto Trading Cost (debit)
+Streaming: Netflix, Spotify, Apple Music, YouTube Premium, Audiomack, Boomplay \u2192 Drawings
+Cloud/Software: AWS, Google Cloud, Azure, GitHub, Figma, Shopify, Zoom, Slack, Canva \u2192 Subscriptions
+Advertising: Google Ads, Facebook Ads, Meta Ads, TikTok Ads \u2192 Advertising
+Supermarkets: Shoprite, Spar, Game Stores, Prince Ebeano, Hubmart, Next Supermarket \u2192 Drawings
+Restaurants/Food: Chicken Republic, Dominos, KFC, Sweet Sensation, Mr Biggs, Tantalizers, The Place, Pizza Hut, Burger King \u2192 Drawings
+
+\u2550\u2550\u2550 NARRATION PATTERN GUIDE \u2550\u2550\u2550
+- "NIP TRANSFER TO {NAME}" \u2192 Transfer if name matches account holder, else Transfer at low confidence
+- "NIP TRANSFER FROM {NAME}" \u2192 Transfer if name matches account holder, else Income at low confidence
+- "SALARY CREDIT", "PAYROLL", "MONTHLY SALARY" \u2192 Income
+- "TRF/{REF}/{NAME}" or "TRF-{NAME}" \u2192 Transfer, confidence depends on name match
+- "REVERSAL", "RVS", "REFUND", "RETURNED" \u2192 Transfer (reversed transaction)
+- "LOAN DISBURSEMENT" from fintech \u2192 Income at low confidence (may be loan, flag for review)
+- "POS PURCHASE", "WEB DEBIT" \u2192 Drawings (card purchase, personal)
+- "COMMISSION" on a credit \u2192 Commission Income
+- "BONUS", "LEAVE ALLOWANCE", "GRATUITY" on a credit \u2192 Income
+- "DIVIDEND" on a credit \u2192 Dividend Income
+- "INTEREST" on a credit \u2192 Bank Interest Received
+- "INTEREST" on a debit \u2192 Interest on Loans
+
+\u2550\u2550\u2550 AMOUNT SIGNALS \u2550\u2550\u2550
+- NGN 50 bare debit with no clear narration \u2192 Bank Charges (stamp duty)
+- NGN 10, 25, or 50 debit with NIP/TRANSFER in narration \u2192 Bank Charges (NIP fee)
+- NGN 4 or 52 debit with SMS/ALERT \u2192 Bank Charges (SMS alert)
+- NGN 35 debit with ATM keyword \u2192 Bank Charges (ATM fee)
+- NGN 1.25 or 3.75 debit \u2192 Bank Charges (VAT on NIP fee)
+- Very large credits (NGN 100,000+) with a person's name \u2192 likely Income or Transfer, not Drawings
+
+\u2550\u2550\u2550 BUSINESS vs PERSONAL (DRAWINGS) \u2550\u2550\u2550
+Use "Drawings" when the spend is clearly personal:
+- Restaurants, fast food, cafes, supermarket/grocery shopping
+- Personal streaming (Netflix, Spotify, Audiomack)
+- Personal clothing/fashion, pharmacies
+- Betting and gambling platforms (Bet9ja, SportyBet, 1xBet)
+- Personal travel (holidays, personal flights)
+Use the appropriate business category when spend is work-related:
+- Office/shop rent \u2192 Office Rent | Internet for office \u2192 Telephone
+- Business travel \u2192 Travel Expenses | Staff salaries \u2192 Salaries and Wages
+- Equipment for business \u2192 Office Equipment or Computer Equipment
+
+\u2550\u2550\u2550 COMMON MISTAKES TO AVOID \u2550\u2550\u2550
+- DSTV, GOtv, StarTimes \u2192 Utilities NOT Subscriptions
+- PAYE deduction \u2192 expense NOT income (despite the word "income" in the category name)
+- Pension contribution \u2192 Pension NOT Insurance
+- NHF contribution \u2192 National Housing Fund NOT Pension
+- Loan repayment debit \u2192 Interest on Loans NOT Bank Charges
+- Loan disbursement credit \u2192 Income at low confidence (flag for review)
+- Stamp duty (NGN 50 debit) \u2192 Bank Charges NOT Drawings
+- Crypto purchase debit \u2192 Crypto Trading Cost NOT Drawings
+- Investment platform debit \u2192 Drawings (personal savings) NOT Subscriptions
+- Airtime/data purchase \u2192 Telephone NOT Subscriptions
+- Carbon/Fairmoney debit \u2192 Interest on Loans NOT Bank Charges
+- Generator diesel \u2192 Fuel NOT Utilities
+- Generator repair \u2192 Repairs and Maintenance NOT Office Equipment
+- Generator purchase \u2192 Office Equipment NOT Repairs and Maintenance
+- School fees \u2192 Training NOT Drawings
+- Church/mosque/tithe payment \u2192 Donations NOT Drawings
+- Annual Rent on a credit \u2192 income type, NOT expense
+
+\u2550\u2550\u2550 CONFIDENCE GUIDANCE \u2550\u2550\u2550
+- 0.95\u20131.00: Completely unambiguous (e.g. "DSTV SUBSCRIPTION", "MTN AIRTIME PURCHASE")
+- 0.80\u20130.94: Clear but slightly ambiguous
+- 0.60\u20130.79: Best guess \u2014 category is plausible but not certain
+- Below 0.60: Genuinely unclear \u2014 will be flagged for user review
+Always use confidence \u2264 0.65 for:
+- Narration is only a person's name with no other context
+- Narration is only a reference number or is blank
+- Transfer to/from a person where purpose is unknown
+- "POS PURCHASE" with no merchant name
+- Generic "PAYMENT" or "TRANSFER" with no other context
+
+\u2550\u2550\u2550 FEW-SHOT EXAMPLES \u2550\u2550\u2550
+DEBIT | NGN 5,000 | "MTN AIRTIME VTU PURCHASE" \u2192 Telephone / expense / 0.97
+CREDIT | NGN 450,000 | "SALARY CREDIT - ACME LTD" \u2192 Income / income / 0.95
+DEBIT | NGN 50 | "NIBSS STAMP DUTY" \u2192 Bank Charges / expense / 0.99
+DEBIT | NGN 120,000 | "OFFICE RENT - JUNE 2024" \u2192 Office Rent / expense / 0.93
+CREDIT | NGN 80,000 | "RENT PAYMENT FROM EMEKA OKAFOR" \u2192 Annual Rent / income / 0.88
+DEBIT | NGN 2,500 | "BOLT RIDE - LAGOS" \u2192 Motor Running Expenses / expense / 0.95
+DEBIT | NGN 15,000 | "PAYE DEDUCTION - MAY 2024" \u2192 PAYE Income / expense / 0.97
+CREDIT | NGN 10,000 | "NIP TRANSFER FROM JOHN ADEYEMI" \u2192 Transfer / income / 0.60
+DEBIT | NGN 5,000 | "NIP TRANSFER TO JOHN ADEYEMI" \u2192 Transfer / expense / 0.60
+DEBIT | NGN 200,000 | "RISEVEST INVESTMENT" \u2192 Drawings / expense / 0.80
+CREDIT | NGN 215,000 | "RISEVEST WITHDRAWAL" \u2192 Investment Income / income / 0.82
+DEBIT | NGN 12,500 | "PAYE TAX - APRIL 2024 - ABC LTD" \u2192 PAYE Income / expense / 0.97
+DEBIT | NGN 33,000 | "NHF CONTRIBUTION - JUNE" \u2192 National Housing Fund / expense / 0.98
+DEBIT | NGN 15,000 | "ARM PENSION CONTRIBUTION" \u2192 Pension / expense / 0.98
+DEBIT | NGN 8,500 | "HYGEIA HMO PREMIUM" \u2192 Health Insurance / expense / 0.96
+CREDIT | NGN 25,000 | "RENT PAYMENT TUNDE BAKARE" \u2192 Annual Rent / income / 0.82
+DEBIT | NGN 45,000 | "FAIRMONEY LOAN REPAYMENT" \u2192 Interest on Loans / expense / 0.88
+CREDIT | NGN 50,000 | "FAIRMONEY LOAN DISBURSEMENT" \u2192 Income / income / 0.70
+DEBIT | NGN 3,500 | "BINANCE CRYPTO PURCHASE" \u2192 Crypto Trading Cost / expense / 0.90
+CREDIT | NGN 180,000 | "BINANCE WITHDRAWAL" \u2192 Crypto Trading Income / income / 0.85
+CREDIT | NGN 500,000 | "CONSULTING FEE - XYZ PROJECT" \u2192 Consulting Income / income / 0.88
+DEBIT | NGN 75,000 | "GOOGLE ADS - CAMPAIGN OCT" \u2192 Advertising / expense / 0.93
+DEBIT | NGN 18,000 | "AWS CLOUD SERVICES" \u2192 Subscriptions / expense / 0.92
+DEBIT | NGN 5,000 | "CHURCH OFFERING - RCCG" \u2192 Donations / expense / 0.85
+DEBIT | NGN 2,200 | "IKEDC PREPAID TOKEN" \u2192 Utilities / expense / 0.97
+DEBIT | NGN 1,500 | "SPECTRANET SUBSCRIPTION" \u2192 Telephone / expense / 0.93
+DEBIT | NGN 320,000 | "STAFF SALARY - JUNE 2024" \u2192 Salaries and Wages / expense / 0.92
+DEBIT | NGN 55,000 | "LAPTOP PURCHASE - SLOT" \u2192 Computer Equipment / expense / 0.85
+DEBIT | NGN 12,000 | "GENERATOR REPAIR - ABUJA" \u2192 Repairs and Maintenance / expense / 0.85
+CREDIT | NGN 200,000 | "NIP TRANSFER FROM ADAEZE OKONKWO" \u2192 Transfer / income / 0.60
+DEBIT | NGN 10 | "NIP FEE" \u2192 Bank Charges / expense / 0.99
+DEBIT | NGN 50 | "" \u2192 Bank Charges / expense / 0.75
 
 Transactions to classify:
 {chr(10).join(tx_lines)}
 
-Return ONLY a JSON array. Example:
-[{{"index":1,"category":"Fuel","type":"expense","confidence":0.9,"explanation":"Payment at fuel station"}}]"""
+Return ONLY a JSON array with one object per transaction, preserving the index number.
+Example: [{{"index":1,"category":"Fuel","type":"expense","confidence":0.9,"explanation":"Payment at Oando fuel station"}}]"""
 
     def classify_batch(
         self,
@@ -1500,6 +1908,7 @@ class SettleTaxClassifier:
             api_key=llm_api_key,
             model=llm_model,
             provider=llm_provider,
+            account_name=account_name,
         )
         self.counterparty_extractor = CounterpartyExtractor()
 
