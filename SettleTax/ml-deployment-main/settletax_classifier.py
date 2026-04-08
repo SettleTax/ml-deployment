@@ -97,6 +97,7 @@ SETTLETAX_EXPENSE_CATEGORIES = [
     "National Housing Fund",     # NHF
     "Pension",                   # Pension contributions
     "Drawings",                  # Personal/non-business expenses
+    "POS Payments",              # Card payments at merchant terminals (POS/web)
     "Transfer",                  # Inter-account transfers
     "Crypto Trading Cost",       # Crypto purchases
     "Capital Gains Cost",        # Cost basis of sold assets
@@ -514,6 +515,7 @@ class StructuralDetector:
             ("POS TRANSACTION FEE", 0.95),
             ("POS SERVICE FEE", 0.95),
             ("POSWEB CHARGE", 0.95),
+            ("POSWEB PURCHASE", 0.95),
             # Token
             ("TOKEN CHARGE", 0.95),
             # Loan / overdraft fees
@@ -695,12 +697,34 @@ class StructuralDetector:
             )
         return None
 
+    def detect_pos(self, narration: str, direction: str) -> Optional[ClassifyResult]:
+        """Detect POS / card payments at merchant terminals."""
+        desc = narration.upper()
+        if direction == "debit" and any(k in desc for k in [
+            "POS PURCHASE", "POS DEBIT", "POS PAYMENT", "POS TXN",
+            "POS TRANS", "POS/WEB", "WEB PURCHASE", "WEB DEBIT",
+            "WEB PAYMENT", "CARD PURCHASE", "CARD PAYMENT",
+            "VISA DEBIT", "MASTERCARD DEBIT", "VERVE DEBIT",
+            "POSWEB PURCHASE", "CHIP AND PIN",
+        ]):
+            return ClassifyResult(
+                category="POS Payments",
+                type="expense",
+                confidence=0.82,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=True,  # merchant name unknown without parsing
+                counterparty=None,
+                explanation="POS/card payment at merchant terminal",
+                rule_hit="pos_payment",
+            )
+        return None
+
     def classify(
         self, narration: str, amount: float, direction: str
     ) -> Optional[ClassifyResult]:
         """
         Run all structural detections. Returns first match or None.
-        Priority: reversal > bank charge > ATM > self-transfer
+        Priority: reversal > bank charge > ATM > POS > self-transfer
         """
         # 1. Reversals first (they override everything)
         result = self.detect_reversal(narration, direction)
@@ -717,7 +741,12 @@ class StructuralDetector:
         if result:
             return result
 
-        # 4. Self-transfer detection
+        # 4. POS / card payments
+        result = self.detect_pos(narration, direction)
+        if result:
+            return result
+
+        # 5. Self-transfer detection
         is_self, score, best_span = self.detect_self_transfer(narration)
         if is_self:
             tx_type = "income" if direction == "credit" else "expense"
@@ -1089,7 +1118,12 @@ class RuleEngine:
         Rule(["LOAN DISBURSEMENT"], "Income", "income", 0.75, "loan_disbursement", direction="credit"),
 
         # ═══ POS PURCHASES ═══
-        Rule(["POS PURCHASE", "POS DEBIT", "WEB PURCHASE", "WEB DEBIT"], "Drawings", "expense", 0.65, "pos_purchase", direction="debit"),
+        Rule(["POS PURCHASE", "POS DEBIT", "POS PAYMENT", "POS TXN", "POS TRANS",
+              "WEB PURCHASE", "WEB DEBIT", "WEB PAYMENT",
+              "CARD PURCHASE", "CARD PAYMENT",
+              "VISA DEBIT", "MASTERCARD DEBIT", "VERVE DEBIT",
+              "CHIP AND PIN", "POSWEB PURCHASE"],
+             "POS Payments", "expense", 0.82, "pos_payment", direction="debit"),
 
         # ═══ SALARIES (EXPENSE — paying employees) ═══
         Rule(["SALARY TO ", "STAFF SALARY", "EMPLOYEE SALARY"], "Salaries and Wages", "expense", 0.88, "salary_out", direction="debit"),
@@ -1452,7 +1486,8 @@ For each transaction, assign:
 - "Legal and Professional Fees" \u2192 lawyers, accountants, CAC, NAFDAC, trademark, notary fees
 - "Training" \u2192 school fees, exams (WAEC/JAMB/ICAN/ACCA), courses, certifications
 - "Donations" \u2192 tithe, offering, zakat, charitable payments
-- "Drawings" \u2192 personal spending NOT related to business (food, personal shopping, streaming, betting)
+- "POS Payments" \u2192 card payments at merchant POS terminals or web checkouts (identifiable by POS/WEB keyword in narration)
+- "Drawings" \u2192 personal spending NOT related to business (food, personal shopping, streaming, betting) — use when merchant is known but no POS keyword
 - "Bank Charges" \u2192 any fee charged BY the bank (NIP fee, stamp duty, VAT on transfer, card fee, SMS alert)
 - "Interest on Loans" \u2192 loan repayments to any lender (bank or fintech)
 - "Pension" \u2192 pension contributions to a PFA
@@ -1476,8 +1511,8 @@ Crypto platforms: Binance, Luno, Quidax, Bybit, Yellow Card, Obiex, Noones \u219
 Streaming: Netflix, Spotify, Apple Music, YouTube Premium, Audiomack, Boomplay \u2192 Drawings
 Cloud/Software: AWS, Google Cloud, Azure, GitHub, Figma, Shopify, Zoom, Slack, Canva \u2192 Subscriptions
 Advertising: Google Ads, Facebook Ads, Meta Ads, TikTok Ads \u2192 Advertising
-Supermarkets: Shoprite, Spar, Game Stores, Prince Ebeano, Hubmart, Next Supermarket \u2192 Drawings
-Restaurants/Food: Chicken Republic, Dominos, KFC, Sweet Sensation, Mr Biggs, Tantalizers, The Place, Pizza Hut, Burger King \u2192 Drawings
+Supermarkets: Shoprite, Spar, Game Stores, Prince Ebeano, Hubmart, Next Supermarket \u2192 POS Payments (if POS/web keyword present) else Drawings
+Restaurants/Food: Chicken Republic, Dominos, KFC, Sweet Sensation, Mr Biggs, Tantalizers, The Place, Pizza Hut, Burger King \u2192 POS Payments (if POS/web keyword present) else Drawings
 
 \u2550\u2550\u2550 NARRATION PATTERN GUIDE \u2550\u2550\u2550
 - "NIP TRANSFER TO {NAME}" \u2192 Transfer if name matches account holder, else Transfer at low confidence
@@ -1486,7 +1521,7 @@ Restaurants/Food: Chicken Republic, Dominos, KFC, Sweet Sensation, Mr Biggs, Tan
 - "TRF/{REF}/{NAME}" or "TRF-{NAME}" \u2192 Transfer, confidence depends on name match
 - "REVERSAL", "RVS", "REFUND", "RETURNED" \u2192 Transfer (reversed transaction)
 - "LOAN DISBURSEMENT" from fintech \u2192 Income at low confidence (may be loan, flag for review)
-- "POS PURCHASE", "WEB DEBIT" \u2192 Drawings (card purchase, personal)
+- "POS PURCHASE", "POS PAYMENT", "WEB DEBIT", "CARD PURCHASE" \u2192 POS Payments (card payment at merchant terminal)
 - "COMMISSION" on a credit \u2192 Commission Income
 - "BONUS", "LEAVE ALLOWANCE", "GRATUITY" on a credit \u2192 Income
 - "DIVIDEND" on a credit \u2192 Dividend Income
@@ -1541,7 +1576,7 @@ Always use confidence \u2264 0.65 for:
 - Narration is only a person's name with no other context
 - Narration is only a reference number or is blank
 - Transfer to/from a person where purpose is unknown
-- "POS PURCHASE" with no merchant name
+- "POS PURCHASE" / "POS PAYMENT" with no merchant name
 - Generic "PAYMENT" or "TRANSFER" with no other context
 
 \u2550\u2550\u2550 FEW-SHOT EXAMPLES \u2550\u2550\u2550
@@ -1577,6 +1612,10 @@ DEBIT | NGN 12,000 | "GENERATOR REPAIR - ABUJA" \u2192 Repairs and Maintenance /
 CREDIT | NGN 200,000 | "NIP TRANSFER FROM ADAEZE OKONKWO" \u2192 Transfer / income / 0.60
 DEBIT | NGN 10 | "NIP FEE" \u2192 Bank Charges / expense / 0.99
 DEBIT | NGN 50 | "" \u2192 Bank Charges / expense / 0.75
+DEBIT | NGN 8,500 | "POS PURCHASE AT SHOPRITE IKEJA" \u2192 POS Payments / expense / 0.90
+DEBIT | NGN 3,200 | "WEB PURCHASE - JUMIA" \u2192 POS Payments / expense / 0.88
+DEBIT | NGN 15,000 | "CARD PAYMENT AT SPAR LEKKI" \u2192 POS Payments / expense / 0.90
+DEBIT | NGN 4,500 | "POS DEBIT" \u2192 POS Payments / expense / 0.75
 
 Transactions to classify:
 {chr(10).join(tx_lines)}
