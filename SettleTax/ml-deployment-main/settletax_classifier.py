@@ -512,6 +512,8 @@ class StructuralDetector:
             ("ATM WITHDRAWAL FEE", 0.95),
             ("POS CHARGE", 0.95),
             ("POS TRANSACTION FEE", 0.95),
+            ("POS SERVICE FEE", 0.95),
+            ("POSWEB CHARGE", 0.95),
             # Token
             ("TOKEN CHARGE", 0.95),
             # Loan / overdraft fees
