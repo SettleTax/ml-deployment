@@ -1,0 +1,2617 @@
+"""
+SettleTax Transaction Classifier v1.0
+=====================================
+4-layer classification engine for Nigerian bank transactions.
+
+Layer 1: Structural Detection (self-transfer, bank charges, reversals, duplicates)
+Layer 2: User History Matching (counterparty → category from past user actions)
+Layer 3: Rule Engine (150+ Nigerian-specific keyword + amount patterns)
+Layer 4: LLM Fallback (batch classification for ambiguous transactions)
+
+Usage:
+    from settletax_classifier import SettleTaxClassifier
+
+    classifier = SettleTaxClassifier(account_name="OBAFEMI-MOSES MOSINMILOLUWA")
+    results = classifier.classify_batch(transactions_df)
+"""
+
+import re
+import json
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Set, Tuple
+from enum import Enum
+
+
+# ═══════════════════════════════════════════════════════════════
+# CORE TYPES
+# ═══════════════════════════════════════════════════════════════
+
+class ClassificationSource(str, Enum):
+    STRUCTURAL = "structural"
+    USER_HISTORY = "user_history"
+    RULE = "rule"
+    LLM = "llm"
+    UNCLASSIFIED = "unclassified"
+
+
+@dataclass
+class ClassifyResult:
+    category: Optional[str]          # SettleTax category label (e.g., "Fuel", "Income")
+    type: str                        # "income" or "expense"
+    confidence: float                # 0.0 to 1.0
+    source: ClassificationSource     # which layer classified it
+    needs_review: bool               # flag for user to confirm
+    counterparty: Optional[str]      # extracted counterparty name
+    explanation: str = ""            # human-readable reason
+    rule_hit: Optional[str] = None   # which rule matched (for debugging)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["source"] = self.source.value
+        return d
+
+
+# ═══════════════════════════════════════════════════════════════
+# SETTLETAX CATEGORY DEFINITIONS
+# These must match income_streams.category exactly
+# ═══════════════════════════════════════════════════════════════
+
+SETTLETAX_INCOME_CATEGORIES = [
+    "Income",                    # General business income / salary
+    "Annual Rent",               # Rental income (landlords)
+    "Bank Interest Received",    # Interest from savings/deposits
+    "Dividend Income",           # Dividends from shares
+    "Investment Income",         # Returns from investment platforms
+    "Crypto Trading Income",     # Crypto trading profits
+    "Capital Gains Income",      # Gains from asset sales
+    "PAYE Income",               # Employment income (PAYE)
+    "Consulting Income",         # Freelance/consulting fees
+    "Commission Income",         # Sales commissions
+]
+
+SETTLETAX_EXPENSE_CATEGORIES = [
+    "Fuel",                      # Petrol, diesel
+    "Motor Running Expenses",    # Vehicle maintenance, Bolt/Uber
+    "Telephone",                 # Airtime, data, telecom
+    "Utilities",                 # Electricity, water, DSTV
+    "Office Rent",               # Office/shop rent
+    "Annual Rent",               # Personal rent (expense side)
+    "Salaries and Wages",        # Staff salaries
+    "Training",                  # Education, courses, school fees
+    "Insurance",                 # General insurance
+    "Bank Charges",              # Bank fees, NIP charges, SMS alerts
+    "Interest on Loans",         # Loan interest/repayments
+    "Legal and Professional Fees", # Legal, accounting, CAC
+    "Repairs and Maintenance",   # Repairs to property/equipment
+    "Advertising",               # Marketing, ads
+    "Stationery",                # Office supplies
+    "Office Equipment",          # Equipment purchases
+    "Computer Equipment",        # IT equipment
+    "Travel Expenses",           # Business travel
+    "Subscriptions",             # Software, memberships
+    "Depreciation",              # Asset depreciation
+    "Bad Debts",                 # Written-off debts
+    "Donations",                 # Charitable donations
+    "Health Insurance",          # NHIS
+    "Life Assurance Premium",    # Life insurance
+    "National Housing Fund",     # NHF
+    "Pension",                   # Pension contributions
+    "Drawings",                  # Personal/non-business expenses
+    "Transfer",                  # Inter-account transfers
+    "Crypto Trading Cost",       # Crypto purchases
+    "Capital Gains Cost",        # Cost basis of sold assets
+]
+
+ALL_CATEGORIES = set(SETTLETAX_INCOME_CATEGORIES + SETTLETAX_EXPENSE_CATEGORIES)
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 1: STRUCTURAL DETECTION
+# ═══════════════════════════════════════════════════════════════
+
+class StructuralDetector:
+    """
+    Detects transactions by their structure, not keywords:
+    - Self-transfers (your money moving between your own accounts)
+    - Bank charges (small fees following transfers)
+    - Reversals (failed/reversed transactions)
+    - Duplicate pairs (same amount, opposite direction, same day)
+    """
+
+    # Known Nigerian noise words in bank narrations
+    NOISE_WORDS = frozenset({
+        "TRANSFER", "BETWEEN", "CUSTOMERS", "PAYMENT", "OUTWARD",
+        "INWARD", "NIP", "FIP", "FAILED", "REVERSAL", "REF",
+        "NIBSS", "INSTANT", "NEFT", "THE", "FOR", "AND", "FROM",
+        "VIA", "MOBILE", "BANKING", "INTERNET", "USSD", "APP",
+        "TRANSACTION", "CHARGE", "FEE", "TO", "OF", "ON", "AT",
+    })
+
+    # Nigerian bank-specific provider patterns
+    PROVIDER_PATTERNS = [
+        # PalmPay: "NIBSS Instan ... PALMPAY ... NIP TRANSFER TO {name}"
+        (r"PALMPAY.*?NIP\s+TRANSFER\s+TO\s+(.+?)$", "palmpay"),
+        # OPay: "OPAY - {prefix} T ... NIP TRANSFER TO {suffix}"
+        (r"OPAY\s*-\s*(.+?)\s+T\s+.*?NIP\s+TRANSFER\s+TO\s+(.+?)$", "opay"),
+        # OPay MFB prefix variant: "OPAYMFB - {name}"
+        (r"OPAYMFB\s*[-:]\s*(.+?)(?:\s*-\s*\S+)?$", "opay"),
+        # Kuda: "Transfer from {name}" or "Transfer to {name}"
+        (r"TRANSFER\s+(?:FROM|TO)\s+(.+?)(?:\s+\d|$)", "kuda"),
+        # Standard NIP: "NIP TRANSFER TO {name}" or "NIP/FIP ... TO {name}"
+        (r"NIP\s+(?:TRANSFER\s+)?TO\s+(.+?)(?:\s+\d{6,}|$)", "nip_standard"),
+        # GTBank: "GTB TRANSFER TO {name}" or "GTBANK/{ref}/{name}"
+        (r"GT(?:B|BANK)\s+(?:TRANSFER\s+)?TO\s+(.+?)(?:/\S+)?$", "gtbank"),
+        (r"GTBANK/\S+/(.+?)$", "gtbank"),
+        # Access Bank: "ACCESS TRANSFER TO {name}" or "ACCESSMOBILE - {name}"
+        (r"ACCESS(?:MOBILE)?\s*[-:]?\s*(?:TRANSFER\s+(?:TO|FROM)\s+)?(.+?)(?:/\S+)?$", "access"),
+        # FCMB: "FCMB TRF TO {name}/{ref}"
+        (r"FCMB\s+TRF\s+(?:TO|FROM)\s+(.+?)(?:/\S+)?$", "fcmb"),
+        # Access/GTB generic: "TRF-{name}/{ref}" or "{name}/TRF/{ref}"
+        (r"TRF[-\s]+(.+?)(?:/|$)", "trf_prefix"),
+        (r"^(.+?)/TRF/", "trf_suffix"),
+        # Zenith: "MC TRANSFER: {ref} {name}"
+        (r"MC\s+TRANSFER:\s*\S+\s+(.+?)$", "zenith"),
+        # Wema/ALAT: "ALAT BY WEMA - Transfer to {name}"
+        (r"ALAT.*?TRANSFER\s+(?:TO|FROM)\s+(.+?)(?:\s*-\s*\S+)?$", "alat"),
+        # Sterling Bank: "STL TRANSFER TO {name}/{ref}"
+        (r"STL\s+TRANSFER\s+TO\s+(.+?)(?:/\S+)?$", "sterling"),
+        # Stanbic IBTC: "STANBIC - {name} - {ref}"
+        (r"STANBIC\s*[-:]\s*(.+?)\s*-\s*\S+$", "stanbic"),
+        # Fidelity Bank: "FID-INT FT TO {name}" or "FID FT{ref} {name}"
+        (r"FID(?:-INT)?\s+FT\S*\s+(.+?)$", "fidelity"),
+        # UBA: "IB TRANSFER TO {name}/{ref}"
+        (r"IB\s+TRANSFER\s+TO\s+(.+?)(?:/\S+)?$", "uba"),
+        # First Bank: "FBN TRANSFER TO {name}" or "FIRSTMOBILE TO {name}"
+        (r"(?:FBN|FIRSTMOBILE)\s+(?:TRANSFER\s+)?TO\s+(.+?)(?:\s+\d|$)", "firstbank"),
+        # Polaris Bank: "POLARIS BANK TRANSFER TO {name}" or "PLR/{ref}/{name}"
+        (r"POLARIS\s+(?:BANK\s+)?(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)$", "polaris"),
+        # Union Bank: "UBN TRF TO {name}/{ref}"
+        (r"UBN\s+TRF\s+(?:TO|FROM)\s+(.+?)(?:/\S+)?$", "union_bank"),
+        # Ecobank: "ECO TRANSFER TO {name}" or "ECOBANK/{ref}/{name}"
+        (r"ECO(?:BANK)?\s+(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)(?:/\S+)?$", "ecobank"),
+        # Jaiz Bank: "JAIZ BANK TRANSFER TO {name}"
+        (r"JAIZ\s+(?:BANK\s+)?(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)$", "jaiz"),
+        # Parallex Bank: "PARALLEX - {name} - {ref}"
+        (r"PARALLEX\s*[-:]\s*(.+?)\s*-\s*\S+$", "parallex"),
+        # Providus Bank: "PROVIDUS TRANSFER: {name}" or "PVB/{ref}/{name}"
+        (r"PROVIDUS\s+(?:BANK\s+)?(?:TRANSFER\s*:?\s*)?(.+?)(?:/\S+)?$", "providus"),
+        # Taj Bank: "TAJ BANK TRANSFER TO {name}"
+        (r"TAJ\s+(?:BANK\s+)?(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)$", "taj"),
+        # Eyowo: "EYOWO - NIP TRANSFER TO {name}"
+        (r"EYOWO.*?(?:TRANSFER\s+)?TO\s+(.+?)$", "eyowo"),
+        # 9PSB: "9PSB TRANSFER TO {name}"
+        (r"9PSB\s+(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)$", "9psb"),
+        # Rubies MFB: "RUBIES - Transfer to {name}"
+        (r"RUBIES\s*[-:]?\s*(?:TRANSFER\s+(?:TO|FROM)\s+)?(.+?)$", "rubies"),
+        # Fairmoney MFB: "FAIRMONEY TRANSFER TO {name} - {ref}"
+        (r"FAIRMONEY\s+(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)\s*-\s*\S+$", "fairmoney"),
+        # Mintyn: "MINTYN - {name}" or "MINT TRANSFER TO {name}"
+        (r"MINT(?:YN)?\s*[-:]?\s*(?:TRANSFER\s+(?:TO|FROM)\s+)?(.+?)$", "mintyn"),
+        # Paystack: "PAYSTACK-{merchant}" or "PAYSTACK {merchant}/{ref}"
+        (r"PAYSTACK[-\s]+(.+?)(?:/\S+)?$", "paystack"),
+        # Flutterwave: "FLW/{ref}/{merchant}"
+        (r"FLW/\S+/(.+?)$", "flutterwave"),
+        # Monnify: "MONNIFY/{merchant}/{ref}"
+        (r"MONNIFY/(.+?)/\S+$", "monnify"),
+        # Interswitch: "ISW/{ref}/{name}" or "ISWTRF/{ref}/{name}"
+        (r"ISW(?:TRF)?/\S+/(.+?)$", "interswitch"),
+        # Interswitch/Quickteller: "QT/{ref}/{merchant}"
+        (r"QT/\S+/(.+?)$", "quickteller"),
+        # Remita: "REMITA PAYMENT FROM/TO {name}/{RRR}"
+        (r"REMITA\s+PAYMENT\s+(?:FROM|TO)\s+(.+?)(?:/\S+)?$", "remita"),
+        # NEFT: "NEFT TRANSFER TO {name}" or "NEFT CR: {name}"
+        (r"NEFT\s+(?:TRANSFER\s+)?(?:TO|CR:\s*)(.+?)(?:\s+\d|$)", "neft"),
+        # VFD Microfinance: "VFD TRANSFER TO {name} - {ref}"
+        (r"VFD\s+(?:TRANSFER\s+)?(?:TO|FROM)\s+(.+?)\s*-\s*\S+$", "vfd"),
+        # Carbon/Paylater: "CARBON - Transfer to {name}" or "PAYLATER {name}"
+        (r"(?:CARBON|PAYLATER)\s*[-:]?\s*(?:TRANSFER\s+(?:TO|FROM)\s+)?(.+?)$", "carbon"),
+        # PAY prefix: "PAY TO {name} - {ref}"
+        (r"PAY\s+TO\s+(.+?)\s*-\s*\S+$", "pay_prefix"),
+        # Moniepoint: "Transfer to {name} - {ref}"
+        (r"TRANSFER\s+TO\s+(.+?)\s*-\s*\S+$", "moniepoint"),
+    ]
+
+    # Compiled provider patterns
+    _compiled_providers = None
+
+    @classmethod
+    def _get_compiled_providers(cls):
+        if cls._compiled_providers is None:
+            cls._compiled_providers = [
+                (re.compile(pat, re.IGNORECASE), name)
+                for pat, name in cls.PROVIDER_PATTERNS
+            ]
+        return cls._compiled_providers
+
+    def __init__(self, account_name: str, account_names: List[str] = None):
+        """
+        Args:
+            account_name: Primary account holder name
+            account_names: Additional name variations (e.g., business name)
+        """
+        self.account_name = account_name
+        self.all_names = [account_name]
+        if account_names:
+            self.all_names.extend(account_names)
+
+        # Pre-compute identity signatures for all names
+        self.owner_signatures = [
+            self._build_identity_signature(name)
+            for name in self.all_names
+        ]
+
+    @staticmethod
+    def _normalize_identity(text: str) -> str:
+        """Strip to uppercase letters only."""
+        return re.sub(r"[^A-Z]", "", text.upper())
+
+    @staticmethod
+    def _char_ngrams(text: str, n: int = 5) -> Set[str]:
+        """Generate character n-grams from text."""
+        return {text[i:i+n] for i in range(len(text) - n + 1)}
+
+    @staticmethod
+    def _ngram_similarity(a: str, b: str, n: int = 5) -> float:
+        """Jaccard similarity of character n-grams."""
+        ga = StructuralDetector._char_ngrams(a, n)
+        gb = StructuralDetector._char_ngrams(b, n)
+        if not ga or not gb:
+            return 0.0
+        intersection = len(ga & gb)
+        union = len(ga | gb)
+        return intersection / union if union > 0 else 0.0
+
+    def _build_identity_signature(self, name: str) -> dict:
+        """Build a reusable identity signature for matching."""
+        clean = self._normalize_identity(name)
+        return {
+            "clean": clean,
+            "ngrams": self._char_ngrams(clean, 5),
+            "tokens": set(re.sub(r"[^A-Z\s]", " ", name.upper()).split()),
+        }
+
+    def _is_name_like(self, token: str) -> bool:
+        """Heuristic: does this token look like a person's name?"""
+        if not token.isalpha() or len(token) < 2 or len(token) > 25:
+            return False
+        vowels = sum(1 for c in token if c in "AEIOU")
+        if vowels == 0:
+            return False
+        if (len(token) - vowels) / len(token) > 0.85:
+            return False
+        if len(set(token)) <= 2:
+            return False
+        return True
+
+    def _extract_name_from_provider(self, narration: str) -> Optional[str]:
+        """Try to extract counterparty name using provider-specific patterns."""
+        text = narration.upper().strip()
+        for pattern, provider in self._get_compiled_providers():
+            match = pattern.search(text)
+            if match:
+                groups = match.groups()
+                if provider == "opay" and len(groups) == 2:
+                    # OPay: concatenate prefix + suffix
+                    return (groups[0] + groups[1]).strip()
+                else:
+                    return groups[0].strip()
+        return None
+
+    def _extract_name_spans(self, narration: str) -> List[str]:
+        """
+        Extract name-like spans from narration by:
+        1. Removing noise words, numbers, references
+        2. Grouping consecutive name-like tokens
+        """
+        clean = re.sub(r"[^A-Z\s\-]", " ", narration.upper())
+        clean = re.sub(r"\s+", " ", clean).strip()
+        tokens = clean.split()
+
+        spans = []
+        current = []
+
+        for tok in tokens:
+            tok_clean = tok.replace("-", "")
+            if (tok_clean.upper() not in self.NOISE_WORDS
+                    and self._is_name_like(tok_clean)):
+                current.append(tok)
+            else:
+                if current:
+                    spans.append(" ".join(current))
+                    current = []
+
+        if current:
+            spans.append(" ".join(current))
+
+        return spans
+
+    def detect_self_transfer(
+        self, narration: str, threshold: float = 0.28
+    ) -> Tuple[bool, float, Optional[str]]:
+        """
+        Detect if a transaction is a self-transfer by matching
+        the counterparty name against the account holder.
+
+        Uses three strategies:
+        1. Provider-specific name extraction (PalmPay, OPay, etc.)
+        2. Individual span matching (each name-like span vs owner)
+        3. Combined span matching (all spans concatenated vs owner)
+           This handles Nigerian banks that fragment names across the narration.
+
+        Returns: (is_self, best_score, best_matching_span)
+        """
+        # Step 1: Try provider-specific extraction first
+        provider_name = self._extract_name_from_provider(narration)
+
+        # Step 2: Extract name spans from narration
+        if provider_name:
+            spans = [provider_name]
+        else:
+            spans = self._extract_name_spans(narration)
+
+        if not spans:
+            return False, 0.0, None
+
+        # Step 3: Compare each individual span against all owner signatures
+        best_score = 0.0
+        best_span = None
+
+        for span in spans:
+            span_clean = self._normalize_identity(span)
+            if len(span_clean) < 3:
+                continue
+
+            for sig in self.owner_signatures:
+                score = self._ngram_similarity(sig["clean"], span_clean)
+                if score > best_score:
+                    best_score = score
+                    best_span = span
+
+                # Also check token overlap as backup
+                span_tokens = set(
+                    re.sub(r"[^A-Z\s]", " ", span.upper()).split()
+                ) - self.NOISE_WORDS
+                overlap = sig["tokens"] & span_tokens
+                if len(overlap) >= 2:
+                    token_score = min(0.50, len(overlap) * 0.20)
+                    if token_score > best_score:
+                        best_score = token_score
+                        best_span = span
+
+        # Step 4: Combined-span matching for fragmented narrations
+        # Nigerian banks (esp. GTBank) scatter name fragments across the narration.
+        # Concatenate all spans and compare as one unit.
+        if len(spans) > 1:
+            combined = " ".join(spans)
+            combined_clean = self._normalize_identity(combined)
+            if len(combined_clean) >= 5:
+                for sig in self.owner_signatures:
+                    # Try multiple n-gram sizes for robustness
+                    for n in [5, 4, 3]:
+                        score = self._ngram_similarity(
+                            sig["clean"], combined_clean, n=n
+                        )
+                        # Penalize smaller n-grams slightly (more false positives)
+                        if n < 5:
+                            score *= (0.85 + (n * 0.03))
+                        if score > best_score:
+                            best_score = score
+                            best_span = combined
+
+                    # Token overlap on the combined text
+                    combined_tokens = set(
+                        re.sub(r"[^A-Z\s]", " ", combined.upper()).split()
+                    ) - self.NOISE_WORDS
+                    overlap = sig["tokens"] & combined_tokens
+                    if len(overlap) >= 2:
+                        token_score = min(0.50, len(overlap) * 0.20)
+                        if token_score > best_score:
+                            best_score = token_score
+                            best_span = combined
+
+        # Step 5: Substring containment check
+        # If the owner's name (stripped of spaces) is substantially
+        # contained within the narration text, it's likely a self-transfer.
+        narration_clean = self._normalize_identity(narration)
+        if len(narration_clean) >= 10:
+            for sig in self.owner_signatures:
+                owner_clean = sig["clean"]
+                # Check if large chunks of the owner name appear in the narration
+                # Try progressively smaller windows of the owner name
+                owner_len = len(owner_clean)
+                if owner_len >= 6:
+                    # Count how many 4-char chunks of the owner appear in narration
+                    chunk_size = 4
+                    chunks = [
+                        owner_clean[i:i+chunk_size]
+                        for i in range(0, owner_len - chunk_size + 1)
+                    ]
+                    hits = sum(1 for c in chunks if c in narration_clean)
+                    if chunks:
+                        containment = hits / len(chunks)
+                        # If >60% of owner's 4-char chunks appear in narration
+                        if containment >= 0.60:
+                            score = min(containment * 0.55, 0.45)
+                            if score > best_score:
+                                best_score = score
+                                best_span = "substring_match"
+
+                # Full narration n-gram as last resort
+                score = self._ngram_similarity(
+                    owner_clean, narration_clean, n=4
+                )
+                score *= 0.80  # Penalize since full narration is very noisy
+                if score > best_score:
+                    best_score = score
+                    best_span = "full_narration"
+
+        return best_score >= threshold, best_score, best_span
+
+    def detect_bank_charge(
+        self, narration: str, amount: float, direction: str
+    ) -> Optional[ClassifyResult]:
+        """
+        Detect bank charges by narration keywords AND amount patterns.
+        """
+        desc = narration.upper()
+
+        # Explicit bank charge keywords (very high confidence)
+        explicit_keywords = [
+            # NIP/NIBSS fees
+            ("NIP TRANSFER COMMISSION", 0.99),
+            ("NIP COMMISSION", 0.99),
+            ("NIP FEE", 0.99),
+            ("NIP CHARGE", 0.99),
+            ("NIBSS FEE", 0.99),
+            ("INTERBANK TRANSFER FEE", 0.99),
+            ("INTERBANK SETTLEMENT FEE", 0.99),
+            # SMS / alert charges
+            ("SMS CHARGE", 0.99),
+            ("SMS ALERT", 0.99),
+            ("SMS NOTIFICATION FEE", 0.99),
+            ("E-ALERT", 0.99),
+            ("ALERT FEE", 0.99),
+            # Account maintenance
+            ("ACCOUNT MAINTENANCE", 0.99),
+            ("ACCT MAINTENANCE", 0.99),
+            ("AMF", 0.99),
+            ("MONTHLY MAINTENANCE", 0.99),
+            ("QUARTERLY MAINTENANCE", 0.99),
+            ("ANNUAL MAINTENANCE", 0.99),
+            ("HALF YEARLY MAINTENANCE", 0.99),
+            # Stamp duty
+            ("STAMP DUTY", 0.99),
+            ("STATUTORY STAMP DUTY", 0.99),
+            ("E-STAMP DUTY", 0.99),
+            ("FIRS STAMP DUTY", 0.99),
+            # VAT
+            ("VAT ON COMMISSION", 0.99),
+            ("VAT ON FEE", 0.99),
+            ("VAT CHARGE", 0.99),
+            ("VAT ON TRANSFER", 0.99),
+            ("VALUE ADDED TAX", 0.99),
+            # Levy
+            ("E-MONEY TRANSFER LEVY", 0.99),
+            ("ELECTRONIC TRANSFER LEVY", 0.99),
+            # COT / commission on turnover
+            ("COT", 0.99),
+            ("COT CHARGE", 0.99),
+            ("COMMISSION ON TURNOVER", 0.99),
+            ("COMMISSION CHARGE", 0.99),
+            # Card charges
+            ("CARD MAINTENANCE", 0.95),
+            ("CARD ISSUANCE", 0.95),
+            ("CARD RENEWAL FEE", 0.95),
+            ("CARD LINKING FEE", 0.95),
+            ("DEBIT CARD FEE", 0.95),
+            ("CREDIT CARD FEE", 0.95),
+            ("VISA CARD FEE", 0.95),
+            ("MASTERCARD FEE", 0.95),
+            ("ATM CARD FEE", 0.95),
+            ("ATM CHARGE", 0.95),
+            ("ATM WITHDRAWAL FEE", 0.95),
+            ("POS CHARGE", 0.95),
+            ("POS TRANSACTION FEE", 0.95),
+            # Token
+            ("TOKEN CHARGE", 0.95),
+            # Loan / overdraft fees
+            ("LOAN PROCESSING FEE", 0.95),
+            ("OVERDRAFT FEE", 0.95),
+            ("OVERDRAFT INTEREST", 0.95),
+            ("CREDIT FACILITY FEE", 0.95),
+            ("CREDIT LIFE INSURANCE", 0.95),
+            ("LIFE ASSURANCE PREMIUM", 0.95),
+            ("MANAGEMENT FEE", 0.75),
+            # Transfer / transaction fees
+            ("TRANSFER FEE", 0.95),
+            ("TRANSACTION FEE", 0.95),
+            ("SERVICE CHARGE", 0.75),
+            ("HANDLING FEE", 0.95),
+            ("PROCESSING FEE", 0.95),
+            ("REVERSAL FEE", 0.95),
+            # Cheque fees
+            ("RETURNED CHEQUE FEE", 0.95),
+            ("CHEQUE BOOK", 0.95),
+            ("CHEQUE PROCESSING", 0.95),
+            # Remittance / FX
+            ("REMITTANCE FEE", 0.95),
+            ("DOMICILIARY ACCOUNT FEE", 0.95),
+            ("FX PROCESSING FEE", 0.95),
+            # Regulatory levies
+            ("CYBERSECURITY LEVY", 0.99),
+            ("CBN CYBERSECURITY LEVY", 0.99),
+            ("CYBERSCURITY LEVY", 0.99),
+            ("NDIC PREMIUM", 0.99),
+            # Penalty charges
+            ("PENALTY FEE", 0.95),
+            ("LATE PAYMENT FEE", 0.95),
+            ("LATE PAYMENT CHARGE", 0.95),
+            ("DISHONOUR FEE", 0.95),
+            # Other fees
+            ("ANNUAL FEE", 0.95),
+            ("SUBSCRIPTION FEE", 0.95),
+            ("REACTIVATION FEE", 0.95),
+            ("INDEMNITY FEE", 0.95),
+            ("STATEMENT FEE", 0.95),
+            ("SWIFT CHARGE", 0.95),
+            ("FOREIGN TRANSFER FEE", 0.95),
+            ("FOREX FEE", 0.95),
+            ("USSD CHARGE", 0.95),
+            ("INTERNET BANKING FEE", 0.95),
+            ("MOBILE BANKING FEE", 0.95),
+        ]
+
+        for keyword, conf in explicit_keywords:
+            if keyword in desc:
+                return ClassifyResult(
+                    category="Bank Charges",
+                    type="expense",
+                    confidence=conf,
+                    source=ClassificationSource.STRUCTURAL,
+                    needs_review=False,
+                    counterparty=None,
+                    explanation=f"Bank charge detected: '{keyword}'",
+                    rule_hit=f"bank_charge_{keyword.lower().replace(' ', '_')}",
+                )
+
+        # Amount-based heuristic: exact NIP fee amounts (₦10, ₦25, ₦50)
+        if direction == "debit" and amount in (10, 25, 50):
+            if any(k in desc for k in ["NIP", "TRANSFER", "COMMISSION"]):
+                return ClassifyResult(
+                    category="Bank Charges",
+                    type="expense",
+                    confidence=0.88,
+                    source=ClassificationSource.STRUCTURAL,
+                    needs_review=False,
+                    counterparty=None,
+                    explanation=f"Exact NIP fee amount (₦{amount}) with transfer keyword",
+                    rule_hit="bank_charge_amount_nip",
+                )
+
+        # SMS alert charge pattern: exactly ₦4 or ₦52 debit
+        if direction == "debit" and amount in (4, 4.00, 52, 52.00):
+            if "SMS" in desc or "ALERT" in desc:
+                return ClassifyResult(
+                    category="Bank Charges",
+                    type="expense",
+                    confidence=0.92,
+                    source=ClassificationSource.STRUCTURAL,
+                    needs_review=False,
+                    counterparty=None,
+                    explanation=f"SMS alert charge (₦{amount})",
+                    rule_hit="bank_charge_sms",
+                )
+
+        # Stamp duty: bare ₦50 debit on credits above ₦10,000 (no keyword required)
+        if direction == "debit" and amount == 50:
+            return ClassifyResult(
+                category="Bank Charges",
+                type="expense",
+                confidence=0.85,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=False,
+                counterparty=None,
+                explanation="Likely stamp duty (₦50 flat debit)",
+                rule_hit="bank_charge_amount_stamp_duty",
+            )
+
+        # VAT on NIP fee: ₦1.25 or ₦3.75 bare debit
+        if direction == "debit" and amount in (1.25, 3.75):
+            return ClassifyResult(
+                category="Bank Charges",
+                type="expense",
+                confidence=0.85,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=False,
+                counterparty=None,
+                explanation=f"Likely VAT on NIP fee (₦{amount})",
+                rule_hit="bank_charge_amount_vat_nip",
+            )
+
+        # ATM withdrawal fee: exact ₦35 debit (after 3 free withdrawals)
+        if direction == "debit" and amount == 35:
+            if any(k in desc for k in ["ATM", "WITHDRAWAL", "CARD"]):
+                return ClassifyResult(
+                    category="Bank Charges",
+                    type="expense",
+                    confidence=0.90,
+                    source=ClassificationSource.STRUCTURAL,
+                    needs_review=False,
+                    counterparty=None,
+                    explanation="ATM withdrawal fee (₦35)",
+                    rule_hit="bank_charge_amount_atm",
+                )
+
+        return None
+
+    def detect_reversal(self, narration: str, direction: str) -> Optional[ClassifyResult]:
+        """Detect failed/reversed transactions."""
+        desc = narration.upper()
+        reversal_keywords = [
+            "REVERSAL", "REVERSED", "FAILED TRANSACTION",
+            "TRANSACTION FAILED", "FAILED TRANSFER", "TRANSFER FAILED",
+            "REFUND", "CHARGEBACK", "DISPUTE",
+            "RVS", "REV",
+            "UNSUCCESSFUL", "DECLINED", "BOUNCED",
+            "CLAWBACK", "RECALL", "RETURNED",
+        ]
+        for keyword in reversal_keywords:
+            if keyword in desc:
+                tx_type = "income" if direction == "credit" else "expense"
+                return ClassifyResult(
+                    category="Transfer",
+                    type=tx_type,
+                    confidence=0.90,
+                    source=ClassificationSource.STRUCTURAL,
+                    needs_review=True,  # user should verify
+                    counterparty=None,
+                    explanation=f"Reversal/refund detected: '{keyword}'",
+                    rule_hit="reversal",
+                )
+        return None
+
+    def detect_atm(self, narration: str, direction: str) -> Optional[ClassifyResult]:
+        """Detect ATM withdrawals."""
+        desc = narration.upper()
+        if direction == "debit" and any(k in desc for k in [
+            "ATM WITHDRAWAL", "ATM CASH WITHDRAWAL", "ATM WDL", "ATM CASH",
+            "ATM TXN", "ATM TRANS", "ATM/WEB", "AUTOMATED TELLER",
+            "OFFUS ATM", "ONUS ATM", "INTERBANK ATM",
+            "CASH WITHDRAWAL", "WDL",
+            "POS CASH", "CASHBACK",
+            "AGENT CASH OUT", "CASH OUT",
+        ]):
+            return ClassifyResult(
+                category="Drawings",
+                type="expense",
+                confidence=0.85,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=True,  # could be business or personal
+                counterparty=None,
+                explanation="ATM cash withdrawal",
+                rule_hit="atm_withdrawal",
+            )
+        return None
+
+    def classify(
+        self, narration: str, amount: float, direction: str
+    ) -> Optional[ClassifyResult]:
+        """
+        Run all structural detections. Returns first match or None.
+        Priority: reversal > bank charge > ATM > self-transfer
+        """
+        # 1. Reversals first (they override everything)
+        result = self.detect_reversal(narration, direction)
+        if result:
+            return result
+
+        # 2. Bank charges (structural pattern, not keyword)
+        result = self.detect_bank_charge(narration, amount, direction)
+        if result:
+            return result
+
+        # 3. ATM withdrawals
+        result = self.detect_atm(narration, direction)
+        if result:
+            return result
+
+        # 4. Self-transfer detection
+        is_self, score, best_span = self.detect_self_transfer(narration)
+        if is_self:
+            tx_type = "income" if direction == "credit" else "expense"
+            # Scale boost by score band to avoid over-inflating weak matches
+            if score >= 0.60:
+                confidence = min(score + 0.20, 0.98)
+            elif score >= 0.40:
+                confidence = min(score + 0.12, 0.98)
+            else:
+                confidence = min(score + 0.05, 0.98)
+            # Flag for review: weak matches OR full-narration/substring fallback spans
+            needs_review = score < 0.50 or best_span in ("substring_match", "full_narration")
+            return ClassifyResult(
+                category="Transfer",
+                type=tx_type,
+                confidence=confidence,
+                source=ClassificationSource.STRUCTURAL,
+                needs_review=needs_review,
+                counterparty=best_span,
+                explanation=f"Self-transfer detected (n-gram score: {score:.3f}, span: '{best_span}')",
+                rule_hit="self_transfer",
+            )
+
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 2: USER HISTORY MATCHING
+# ═══════════════════════════════════════════════════════════════
+
+class UserHistoryMatcher:
+    """
+    Matches transactions against previously categorised counterparties.
+
+    In production, this reads from the `counterparty_mappings` table.
+    For testing, you can pre-load mappings manually.
+    """
+
+    def __init__(self, mappings: Dict[str, dict] = None):
+        """
+        Args:
+            mappings: Dict of counterparty name → {category, type, match_count}
+                      Keys will be normalized automatically.
+        """
+        self.mappings: Dict[str, dict] = {}
+        if mappings:
+            for key, value in mappings.items():
+                normalized = self._normalize(key)
+                self.mappings[normalized] = value
+
+    def add_mapping(
+        self, counterparty: str, category: str, tx_type: str, source: str = "user"
+    ):
+        """Add or update a counterparty → category mapping."""
+        key = self._normalize(counterparty)
+        if key in self.mappings:
+            self.mappings[key]["match_count"] += 1
+            # Update category if user explicitly re-categorised
+            if source == "user":
+                self.mappings[key]["category"] = category
+                self.mappings[key]["type"] = tx_type
+        else:
+            self.mappings[key] = {
+                "category": category,
+                "type": tx_type,
+                "match_count": 1,
+                "source": source,
+            }
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """Normalize counterparty name for matching.
+
+        Only strips formal legal suffixes (LTD, PLC, etc.), not business
+        descriptors like ENTERPRISES which may be part of the actual name.
+        """
+        text = text.upper().strip()
+        text = re.sub(r"[^A-Z\s]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        # Only strip formal legal entity suffixes
+        for suffix in [" LTD", " LIMITED", " PLC", " INC", " LLC"]:
+            if text.endswith(suffix):
+                text = text[:-len(suffix)].strip()
+        return text
+
+    @staticmethod
+    def _fuzzy_match(a: str, b: str) -> float:
+        """Simple token overlap similarity."""
+        tokens_a = set(a.split())
+        tokens_b = set(b.split())
+        if not tokens_a or not tokens_b:
+            return 0.0
+        overlap = len(tokens_a & tokens_b)
+        return overlap / max(len(tokens_a), len(tokens_b))
+
+    def classify(self, counterparty: Optional[str]) -> Optional[ClassifyResult]:
+        """Look up counterparty in user history."""
+        if not counterparty:
+            return None
+
+        key = self._normalize(counterparty)
+        if not key:
+            return None
+
+        # Exact match
+        if key in self.mappings:
+            m = self.mappings[key]
+            confidence = min(0.70 + (m["match_count"] * 0.05), 0.95)
+            return ClassifyResult(
+                category=m["category"],
+                type=m["type"],
+                confidence=confidence,
+                source=ClassificationSource.USER_HISTORY,
+                needs_review=m["match_count"] < 3,
+                counterparty=counterparty,
+                explanation=f"Matched counterparty '{counterparty}' (seen {m['match_count']}x before)",
+                rule_hit="history_exact",
+            )
+
+        # Fuzzy match (for slight name variations)
+        best_score = 0.0
+        best_key = None
+        for existing_key in self.mappings:
+            score = self._fuzzy_match(key, existing_key)
+            if score > best_score:
+                best_score = score
+                best_key = existing_key
+
+        if best_score >= 0.70 and best_key:
+            m = self.mappings[best_key]
+            confidence = min(0.55 + (best_score * 0.30), 0.85)
+            return ClassifyResult(
+                category=m["category"],
+                type=m["type"],
+                confidence=confidence,
+                source=ClassificationSource.USER_HISTORY,
+                needs_review=True,  # fuzzy match always needs review
+                counterparty=counterparty,
+                explanation=f"Fuzzy match '{counterparty}' ≈ '{best_key}' (score: {best_score:.2f})",
+                rule_hit="history_fuzzy",
+            )
+
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 3: RULE ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Rule:
+    keywords: List[str]
+    category: str
+    type: str  # "income" or "expense"
+    confidence: float
+    rule_name: str
+    direction: Optional[str] = None      # "debit" or "credit" or None
+    amount_min: Optional[float] = None
+    amount_max: Optional[float] = None
+    exclude_keywords: List[str] = field(default_factory=list)
+
+    def matches(self, narration: str, direction: str, amount: float) -> bool:
+        desc = narration.upper()
+
+        # Check keyword match
+        if not any(k in desc for k in self.keywords):
+            return False
+
+        # Check exclusions
+        if any(k in desc for k in self.exclude_keywords):
+            return False
+
+        # Check direction
+        if self.direction and self.direction != direction:
+            return False
+
+        # Check amount range
+        if self.amount_min is not None and amount < self.amount_min:
+            return False
+        if self.amount_max is not None and amount > self.amount_max:
+            return False
+
+        return True
+
+
+class RuleEngine:
+    """
+    150+ Nigerian-specific classification rules.
+    Rules are ordered by specificity (most specific first).
+    """
+
+    RULES: List[Rule] = [
+        # ═══ TAX PAYMENTS ═══
+        Rule(["FEDERAL INLAND REVENUE", "FIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_firs"),
+        Rule(["LAGOS INTERNAL REVENUE", "LIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_lirs"),
+        Rule(["PAYE DEDUCTION", "PAYE PAYMENT", "PAYE TAX"], "PAYE Income", "expense", 0.96, "tax_paye"),
+        Rule(["WITHHOLDING TAX", "WHT PAYMENT", "WHT DEDUCTION"], "PAYE Income", "expense", 0.93, "tax_wht"),
+        Rule(["VAT PAYMENT", "VAT REMITTANCE"], "PAYE Income", "expense", 0.93, "tax_vat",
+             exclude_keywords=["VAT ON COMMISSION", "VAT ON FEE"]),  # avoid bank charges
+
+        # ═══ RELIEFS ═══
+        Rule(["NATIONAL HOUSING FUND", "NHF DEDUCTION", "NHF CONTRIBUTION"], "National Housing Fund", "expense", 0.98, "relief_nhf"),
+        Rule(["NATIONAL HEALTH INSURANCE", "NHIS DEDUCTION", "NHIS CONTRIBUTION"], "Health Insurance", "expense", 0.98, "relief_nhis"),
+        Rule(["LIFE ASSURANCE PREMIUM", "LIFE ASSURANCE", "LIFE INSURANCE PREMIUM"], "Life Assurance Premium", "expense", 0.96, "relief_life"),
+        Rule(["AIICO INSURANCE", "AIICO"], "Life Assurance Premium", "expense", 0.93, "relief_aiico"),
+        Rule(["AXA MANSARD", "AXA INSURANCE"], "Life Assurance Premium", "expense", 0.93, "relief_axa"),
+        Rule(["PENSION CONTRIBUTION", "PFA CONTRIBUTION", "RSA CONTRIBUTION", "PENCOM"], "Pension", "expense", 0.96, "relief_pension"),
+
+        # ═══ UTILITIES — ELECTRICITY ═══
+        Rule(["IKEJA ELECTRIC", "IKEDC", "IKEJA DISCO"], "Utilities", "expense", 0.96, "util_ikeja"),
+        Rule(["EKO ELECTRICITY", "EKO DISCO", "EKEDC"], "Utilities", "expense", 0.96, "util_eko"),
+        Rule(["IBADAN ELECTRIC", "IBEDC"], "Utilities", "expense", 0.96, "util_ibedc"),
+        Rule(["ABUJA ELECTRIC", "AEDC"], "Utilities", "expense", 0.96, "util_aedc"),
+        Rule(["ENUGU ELECTRIC", "EEDC"], "Utilities", "expense", 0.96, "util_eedc"),
+        Rule(["BENIN ELECTRIC", "BEDC"], "Utilities", "expense", 0.96, "util_bedc"),
+        Rule(["JOS ELECTRIC", "JEDC"], "Utilities", "expense", 0.96, "util_jedc"),
+        Rule(["KADUNA ELECTRIC", "KAEDCO"], "Utilities", "expense", 0.96, "util_kaduna"),
+        Rule(["PORT HARCOURT ELECTRIC", "PHEDC"], "Utilities", "expense", 0.96, "util_ph"),
+        Rule(["ELECTRICITY", "PREPAID METER", "BUY POWER", "BUYPOWER"], "Utilities", "expense", 0.90, "util_electricity"),
+
+        # ═══ UTILITIES — TV/CABLE ═══
+        Rule(["DSTV", "MULTICHOICE"], "Utilities", "expense", 0.93, "util_dstv"),
+        Rule(["GOTV"], "Utilities", "expense", 0.93, "util_gotv"),
+        Rule(["STARTIMES"], "Utilities", "expense", 0.93, "util_startimes"),
+        Rule(["SHOWMAX"], "Utilities", "expense", 0.90, "util_showmax"),
+
+        # ═══ UTILITIES — WATER / WASTE ═══
+        Rule(["WATER CORPORATION", "WATER BOARD", "WATERBOARD"], "Utilities", "expense", 0.90, "util_water"),
+        Rule(["LAWMA", "WASTE MANAGEMENT"], "Utilities", "expense", 0.90, "util_lawma"),
+
+        # ═══ TELECOM / AIRTIME ═══
+        Rule(["MTN AIRTIME", "MTN DATA", "MTN VTU"], "Telephone", "expense", 0.95, "tel_mtn_explicit"),
+        Rule(["GLO AIRTIME", "GLO DATA", "GLO VTU"], "Telephone", "expense", 0.95, "tel_glo_explicit"),
+        Rule(["AIRTEL AIRTIME", "AIRTEL DATA", "AIRTEL VTU"], "Telephone", "expense", 0.95, "tel_airtel_explicit"),
+        Rule(["9MOBILE AIRTIME", "9MOBILE DATA", "ETISALAT"], "Telephone", "expense", 0.95, "tel_9mobile"),
+        Rule(["AIRTIME PURCHASE", "AIRTIME TOP", "VTU PURCHASE", "DATA BUNDLE", "DATA PURCHASE", "DATA SUBSCRIPTION"], "Telephone", "expense", 0.93, "tel_airtime_generic"),
+        # MTN/GLO alone are less certain (could be in narration context)
+        Rule(["MTN"], "Telephone", "expense", 0.78, "tel_mtn_weak", direction="debit", amount_max=50000),
+        Rule(["GLO"], "Telephone", "expense", 0.78, "tel_glo_weak", direction="debit", amount_max=50000),
+        Rule(["AIRTEL"], "Telephone", "expense", 0.78, "tel_airtel_weak", direction="debit", amount_max=50000),
+
+        # ═══ FUEL ═══
+        Rule(["OANDO"], "Fuel", "expense", 0.93, "fuel_oando", direction="debit"),
+        Rule(["TOTAL ENERGIES", "TOTALENERGIES"], "Fuel", "expense", 0.93, "fuel_total"),
+        Rule(["SHELL PETROLEUM", "SHELL PETROL"], "Fuel", "expense", 0.93, "fuel_shell"),
+        Rule(["MOBIL FILLING", "MOBIL PETROL", "MOBIL OIL"], "Fuel", "expense", 0.93, "fuel_mobil"),
+        Rule(["CONOIL"], "Fuel", "expense", 0.93, "fuel_conoil"),
+        Rule(["ARDOVA"], "Fuel", "expense", 0.93, "fuel_ardova"),
+        Rule(["PETROL STATION", "FILLING STATION", "FUEL STATION", "DIESEL PURCHASE"], "Fuel", "expense", 0.88, "fuel_station_generic"),
+        Rule(["PETROL", "DIESEL", "FUEL"], "Fuel", "expense", 0.78, "fuel_keyword", direction="debit"),
+
+        # ═══ TRANSPORT ═══
+        Rule(["BOLT RIDE", "BOLT TECHNOLOGY", "BOLT TRANSPORT"], "Motor Running Expenses", "expense", 0.90, "transport_bolt"),
+        Rule(["UBER RIDE", "UBER TRIP", "UBER BV"], "Motor Running Expenses", "expense", 0.90, "transport_uber"),
+        Rule(["INDRIVE"], "Motor Running Expenses", "expense", 0.88, "transport_indrive"),
+        Rule(["VEHICLE LICENCE", "ROAD WORTHINESS", "VEHICLE REGISTRATION"], "Motor Running Expenses", "expense", 0.88, "transport_licence"),
+        Rule(["FRSC"], "Motor Running Expenses", "expense", 0.85, "transport_frsc"),
+        Rule(["TOLL FEE", "TOLL GATE", "LCC TOLL", "TOLL PAYMENT"], "Motor Running Expenses", "expense", 0.90, "transport_toll"),
+
+        # ═══ RENT (EXPENSE) ═══
+        Rule(["OFFICE RENT", "SHOP RENT", "WAREHOUSE RENT", "RENT PAYMENT"], "Office Rent", "expense", 0.88, "rent_office", direction="debit"),
+        Rule(["HOUSE RENT", "APARTMENT RENT"], "Annual Rent", "expense", 0.82, "rent_house", direction="debit"),
+        Rule(["ANNUAL RENT"], "Annual Rent", "expense", 0.80, "rent_annual", direction="debit"),
+        Rule(["CARETAKER"], "Annual Rent", "expense", 0.75, "rent_caretaker", direction="debit"),
+
+        # ═══ RENT (INCOME) ═══
+        Rule(["RENT INCOME", "RENTAL INCOME"], "Annual Rent", "income", 0.88, "rent_income", direction="credit"),
+        Rule(["TENANT PAYMENT", "TENANT"], "Annual Rent", "income", 0.78, "rent_tenant", direction="credit"),
+
+        # ═══ SALARY / EMPLOYMENT INCOME ═══
+        Rule(["SALARY PAYMENT", "SALARY CREDIT", "MONTHLY SALARY"], "Income", "income", 0.93, "salary_explicit", direction="credit"),
+        Rule(["PAYROLL"], "Income", "income", 0.90, "salary_payroll", direction="credit"),
+        Rule(["NEFT SALARY", "NEFT CREDIT"], "Income", "income", 0.85, "salary_neft", direction="credit"),
+
+        # ═══ BUSINESS INCOME (generic credits) ═══
+        Rule(["INVOICE PAYMENT", "INV PAYMENT"], "Income", "income", 0.85, "income_invoice", direction="credit"),
+        Rule(["CONSULTING FEE", "CONSULTING PAYMENT"], "Consulting Income", "income", 0.88, "income_consulting", direction="credit"),
+        Rule(["COMMISSION"], "Commission Income", "income", 0.75, "income_commission", direction="credit"),
+
+        # ═══ BANK INTEREST (INCOME) ═══
+        Rule(["INTEREST CREDIT", "INTEREST EARNED", "INTEREST PAYMENT", "INT CREDIT"], "Bank Interest Received", "income", 0.95, "interest_income", direction="credit"),
+
+        # ═══ PERSONAL / NON-DEDUCTIBLE (DRAWINGS) ═══
+        Rule(["SHOPRITE"], "Drawings", "expense", 0.92, "personal_shoprite"),
+        Rule(["SPAR SUPERMARKET", "SPAR NIGERIA"], "Drawings", "expense", 0.90, "personal_spar"),
+        Rule(["GAME STORES", "GAME NIGERIA"], "Drawings", "expense", 0.90, "personal_game"),
+        Rule(["CHICKEN REPUBLIC"], "Drawings", "expense", 0.90, "personal_chicken_republic"),
+        Rule(["DOMINOS", "DOMINO PIZZA", "DOMINO'S"], "Drawings", "expense", 0.90, "personal_dominos"),
+        Rule(["COLD STONE", "COLDSTONE"], "Drawings", "expense", 0.90, "personal_coldstone"),
+        Rule(["KILIMANJARO"], "Drawings", "expense", 0.88, "personal_kilimanjaro"),
+        Rule(["KFC", "KENTUCKY FRIED"], "Drawings", "expense", 0.90, "personal_kfc"),
+        Rule(["THE PLACE RESTAURANT", "THE PLACE"], "Drawings", "expense", 0.85, "personal_theplace"),
+        Rule(["SWEET SENSATION"], "Drawings", "expense", 0.90, "personal_sweetsensation"),
+        Rule(["MR BIGGS", "MR. BIGGS"], "Drawings", "expense", 0.90, "personal_mrbiggs"),
+        Rule(["TANTALIZER", "TANTALIZERS"], "Drawings", "expense", 0.90, "personal_tantalizers"),
+
+        # ═══ STREAMING / ENTERTAINMENT ═══
+        Rule(["NETFLIX"], "Drawings", "expense", 0.92, "personal_netflix"),
+        Rule(["SPOTIFY"], "Drawings", "expense", 0.92, "personal_spotify"),
+        Rule(["APPLE.COM", "APPLE MUSIC", "APPLE ONE"], "Drawings", "expense", 0.88, "personal_apple"),
+        Rule(["GOOGLE PLAY", "GOOGLE STORAGE", "GOOGLE ONE"], "Drawings", "expense", 0.88, "personal_google"),
+        Rule(["AMAZON PRIME"], "Drawings", "expense", 0.88, "personal_amazon"),
+        Rule(["YOUTUBE PREMIUM"], "Drawings", "expense", 0.88, "personal_youtube"),
+
+        # ═══ ONLINE SHOPPING ═══
+        Rule(["JUMIA"], "Drawings", "expense", 0.75, "personal_jumia", direction="debit"),
+        Rule(["KONGA"], "Drawings", "expense", 0.75, "personal_konga", direction="debit"),
+        Rule(["PAYPORTE"], "Drawings", "expense", 0.80, "personal_payporte"),
+
+        # ═══ INVESTMENTS ═══
+        Rule(["RISEVEST", "RISE VEST"], "Investment Income", "income", 0.82, "invest_risevest", direction="credit"),
+        Rule(["COWRYWISE"], "Investment Income", "income", 0.82, "invest_cowrywise", direction="credit"),
+        Rule(["PIGGYVEST", "PIGGYBANK"], "Investment Income", "income", 0.78, "invest_piggyvest", direction="credit"),
+        Rule(["BAMBOO"], "Investment Income", "income", 0.78, "invest_bamboo", direction="credit"),
+        Rule(["CHAKA"], "Investment Income", "income", 0.78, "invest_chaka", direction="credit"),
+        Rule(["TROVE"], "Investment Income", "income", 0.78, "invest_trove", direction="credit"),
+        # Debits to investment platforms = investment cost
+        Rule(["RISEVEST", "RISE VEST"], "Drawings", "expense", 0.78, "invest_risevest_out", direction="debit"),
+        Rule(["COWRYWISE"], "Drawings", "expense", 0.78, "invest_cowrywise_out", direction="debit"),
+        Rule(["PIGGYVEST", "PIGGYBANK"], "Drawings", "expense", 0.78, "invest_piggyvest_out", direction="debit"),
+
+        # ═══ CRYPTO ═══
+        Rule(["BINANCE"], "Crypto Trading Income", "income", 0.80, "crypto_binance_in", direction="credit"),
+        Rule(["LUNO"], "Crypto Trading Income", "income", 0.80, "crypto_luno_in", direction="credit"),
+        Rule(["QUIDAX"], "Crypto Trading Income", "income", 0.80, "crypto_quidax_in", direction="credit"),
+        Rule(["PATRICIA"], "Crypto Trading Income", "income", 0.78, "crypto_patricia_in", direction="credit"),
+        Rule(["BYBIT"], "Crypto Trading Income", "income", 0.80, "crypto_bybit_in", direction="credit"),
+        Rule(["ROQQU"], "Crypto Trading Income", "income", 0.78, "crypto_roqqu_in", direction="credit"),
+        Rule(["BINANCE"], "Crypto Trading Cost", "expense", 0.80, "crypto_binance_out", direction="debit"),
+        Rule(["LUNO"], "Crypto Trading Cost", "expense", 0.80, "crypto_luno_out", direction="debit"),
+        Rule(["QUIDAX"], "Crypto Trading Cost", "expense", 0.80, "crypto_quidax_out", direction="debit"),
+
+        # ═══ INSURANCE ═══
+        Rule(["LEADWAY ASSURANCE", "LEADWAY INSURANCE"], "Insurance", "expense", 0.93, "insurance_leadway"),
+        Rule(["CUSTODIAN INSURANCE", "CUSTODIAN ALLIED"], "Insurance", "expense", 0.93, "insurance_custodian"),
+        Rule(["HEIRS INSURANCE", "HEIRS ASSURANCE"], "Insurance", "expense", 0.93, "insurance_heirs"),
+        Rule(["CORONATION INSURANCE"], "Insurance", "expense", 0.93, "insurance_coronation"),
+        Rule(["INSURANCE PREMIUM"], "Insurance", "expense", 0.88, "insurance_generic"),
+
+        # ═══ GOVERNMENT / LEGAL ═══
+        Rule(["CORPORATE AFFAIRS COMMISSION", "CAC PAYMENT", "CAC FEE"], "Legal and Professional Fees", "expense", 0.90, "legal_cac"),
+        Rule(["IMMIGRATION", "NIS PAYMENT"], "Legal and Professional Fees", "expense", 0.85, "legal_immigration"),
+        Rule(["COURT FEE", "LEGAL FEE", "SOLICITOR"], "Legal and Professional Fees", "expense", 0.85, "legal_fees"),
+
+        # ═══ EDUCATION ═══
+        Rule(["SCHOOL FEE", "SCHOOL FEES", "TUITION"], "Training", "expense", 0.85, "edu_school"),
+        Rule(["UNIVERSITY"], "Training", "expense", 0.80, "edu_university"),
+        Rule(["WAEC", "JAMB", "NECO"], "Training", "expense", 0.88, "edu_exams"),
+        Rule(["TRAINING FEE", "COURSE FEE", "SEMINAR"], "Training", "expense", 0.85, "edu_training"),
+
+        # ═══ SOFTWARE SUBSCRIPTIONS ═══
+        Rule(["CANVA"], "Subscriptions", "expense", 0.90, "sub_canva"),
+        Rule(["ZOOM"], "Subscriptions", "expense", 0.88, "sub_zoom"),
+        Rule(["SLACK"], "Subscriptions", "expense", 0.88, "sub_slack"),
+        Rule(["MICROSOFT", "OFFICE 365"], "Subscriptions", "expense", 0.88, "sub_microsoft"),
+        Rule(["ADOBE"], "Subscriptions", "expense", 0.88, "sub_adobe"),
+        Rule(["NOTION"], "Subscriptions", "expense", 0.88, "sub_notion"),
+
+        # ═══ LOAN PLATFORMS ═══
+        Rule(["CARBON LOAN", "CARBON FINANCE", "ONE FINANCE"], "Interest on Loans", "expense", 0.82, "loan_carbon", direction="debit"),
+        Rule(["FAIRMONEY"], "Interest on Loans", "expense", 0.82, "loan_fairmoney", direction="debit"),
+        Rule(["BRANCH LOAN", "BRANCH INT"], "Interest on Loans", "expense", 0.82, "loan_branch", direction="debit"),
+        Rule(["PALMCREDIT"], "Interest on Loans", "expense", 0.82, "loan_palmcredit", direction="debit"),
+        Rule(["RENMONEY"], "Interest on Loans", "expense", 0.82, "loan_renmoney", direction="debit"),
+        Rule(["LOAN REPAYMENT", "LOAN DEDUCTION"], "Interest on Loans", "expense", 0.85, "loan_generic", direction="debit"),
+        # Loan disbursements (credit side) = income/transfer
+        Rule(["CARBON LOAN", "CARBON FINANCE"], "Income", "income", 0.70, "loan_carbon_in", direction="credit"),
+        Rule(["FAIRMONEY"], "Income", "income", 0.70, "loan_fairmoney_in", direction="credit"),
+        Rule(["LOAN DISBURSEMENT"], "Income", "income", 0.75, "loan_disbursement", direction="credit"),
+
+        # ═══ POS PURCHASES ═══
+        Rule(["POS PURCHASE", "POS DEBIT", "WEB PURCHASE", "WEB DEBIT"], "Drawings", "expense", 0.65, "pos_purchase", direction="debit"),
+
+        # ═══ SALARIES (EXPENSE — paying employees) ═══
+        Rule(["SALARY TO ", "STAFF SALARY", "EMPLOYEE SALARY"], "Salaries and Wages", "expense", 0.88, "salary_out", direction="debit"),
+        Rule(["WAGES PAYMENT", "WAGE PAYMENT"], "Salaries and Wages", "expense", 0.88, "wages_out", direction="debit"),
+        Rule(["CONTRACTOR PAYMENT", "FREELANCER PAYMENT"], "Legal and Professional Fees", "expense", 0.80, "contractor_payment", direction="debit"),
+        Rule(["NANNY SALARY", "DRIVER SALARY", "GATEMAN SALARY", "DOMESTIC STAFF"], "Drawings", "expense", 0.85, "personal_staff", direction="debit"),
+
+        # ═══ TAX PAYMENTS — STATE REVENUE SERVICES ═══
+        Rule(["RIVERS STATE INTERNAL REVENUE", "RIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_rirs"),
+        Rule(["OGUN STATE INTERNAL REVENUE", "OGSIRS"], "PAYE Income", "expense", 0.97, "tax_ogsirs"),
+        Rule(["KANO STATE INTERNAL REVENUE", "KIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_kirs"),
+        Rule(["ANAMBRA INTERNAL REVENUE", "AIRS PAYMENT"], "PAYE Income", "expense", 0.97, "tax_airs"),
+        Rule(["DELTA STATE INTERNAL REVENUE"], "PAYE Income", "expense", 0.97, "tax_delta"),
+        Rule(["BUSINESS PREMISES LEVY"], "PAYE Income", "expense", 0.90, "tax_bpl"),
+        Rule(["DEVELOPMENT LEVY"], "PAYE Income", "expense", 0.88, "tax_dev_levy"),
+        Rule(["CAPITAL GAINS TAX", "CGT PAYMENT"], "Capital Gains Income", "expense", 0.93, "tax_cgt"),
+        Rule(["STAMP DUTIES PAYMENT", "STAMP DUTY PAYMENT"], "PAYE Income", "expense", 0.90, "tax_stamp_duties",
+             exclude_keywords=["STAMP DUTY"]),
+
+        # ═══ RELIEFS — PFAs ═══
+        Rule(["ARM PENSION"], "Pension", "expense", 0.96, "relief_arm_pension"),
+        Rule(["STANBIC IBTC PENSION"], "Pension", "expense", 0.96, "relief_stanbic_pension"),
+        Rule(["AIICO PENSION"], "Pension", "expense", 0.96, "relief_aiico_pension"),
+        Rule(["PREMIUM PENSION"], "Pension", "expense", 0.96, "relief_premium_pension"),
+        Rule(["CRUSADER STERLING PENSION"], "Pension", "expense", 0.96, "relief_crusader_pension"),
+        Rule(["LEADWAY PENSURE"], "Pension", "expense", 0.96, "relief_leadway_pension"),
+        Rule(["PAL PENSIONS"], "Pension", "expense", 0.96, "relief_pal_pension"),
+        Rule(["NSITF", "EMPLOYEES COMPENSATION"], "PAYE Income", "expense", 0.93, "relief_nsitf"),
+
+        # ═══ RELIEFS — HMOs ═══
+        Rule(["HYGEIA HMO", "HYGEIA"], "Health Insurance", "expense", 0.93, "hmo_hygeia"),
+        Rule(["TOTAL HEALTH TRUST", "THT HMO"], "Health Insurance", "expense", 0.93, "hmo_tht"),
+        Rule(["RELIANCE HMO"], "Health Insurance", "expense", 0.93, "hmo_reliance"),
+        Rule(["AVON HMO"], "Health Insurance", "expense", 0.93, "hmo_avon"),
+        Rule(["CLEARLINE HMO"], "Health Insurance", "expense", 0.93, "hmo_clearline"),
+
+        # ═══ UTILITIES — ELECTRICITY (MISSING DISCOs) ═══
+        Rule(["KANO ELECTRICITY", "KEDCO"], "Utilities", "expense", 0.96, "util_kedco"),
+        Rule(["YOLA ELECTRICITY", "YEDC"], "Utilities", "expense", 0.96, "util_yedc"),
+        Rule(["SOKOTO ELECTRICITY", "SEDCO"], "Utilities", "expense", 0.96, "util_sedco"),
+        Rule(["NEPA", "PHCN"], "Utilities", "expense", 0.88, "util_nepa_legacy"),
+        Rule(["PREPAID TOKEN"], "Utilities", "expense", 0.90, "util_prepaid_token"),
+
+        # ═══ UTILITIES — INTERNET/BROADBAND ═══
+        Rule(["SPECTRANET"], "Telephone", "expense", 0.93, "isp_spectranet"),
+        Rule(["SMILE NETWORK", "SMILE COMMUNICATIONS"], "Telephone", "expense", 0.93, "isp_smile"),
+        Rule(["IPNX"], "Telephone", "expense", 0.93, "isp_ipnx"),
+        Rule(["SWIFT NETWORKS"], "Telephone", "expense", 0.93, "isp_swift"),
+        Rule(["COOLLINK"], "Telephone", "expense", 0.93, "isp_coollink"),
+        Rule(["NTEL"], "Telephone", "expense", 0.88, "tel_ntel"),
+        Rule(["BROADBAND", "FIBRE SUBSCRIPTION", "FIBER SUBSCRIPTION"], "Telephone", "expense", 0.88, "isp_generic"),
+
+        # ═══ FUEL — MISSING STATIONS ═══
+        Rule(["MRS OIL", "MRS PETROLEUM"], "Fuel", "expense", 0.93, "fuel_mrs"),
+        Rule(["NIPCO"], "Fuel", "expense", 0.93, "fuel_nipco"),
+        Rule(["11 PLC", "11PLC"], "Fuel", "expense", 0.93, "fuel_11plc"),
+        Rule(["HEYDEN PETROLEUM"], "Fuel", "expense", 0.93, "fuel_heyden"),
+        Rule(["RAINOIL"], "Fuel", "expense", 0.93, "fuel_rainoil"),
+        Rule(["A-Z PETROLEUM"], "Fuel", "expense", 0.93, "fuel_az"),
+        Rule(["GENERATOR FUEL", "GENERATOR DIESEL", "DIESEL FOR GENERATOR"], "Fuel", "expense", 0.90, "fuel_generator"),
+
+        # ═══ TRANSPORT — RIDE HAILING / TRAVEL ═══
+        Rule(["SHUTTLERS"], "Motor Running Expenses", "expense", 0.88, "transport_shuttlers"),
+        Rule(["LAGRIDE"], "Motor Running Expenses", "expense", 0.88, "transport_lagride"),
+        Rule(["BRT PAYMENT", "COWRY CARD"], "Motor Running Expenses", "expense", 0.88, "transport_brt"),
+        Rule(["VEHICLE REPAIR", "CAR SERVICE", "PANEL BEATING", "TYRE PURCHASE"], "Motor Running Expenses", "expense", 0.85, "transport_vehicle_repair"),
+        Rule(["AIR PEACE"], "Travel Expenses", "expense", 0.90, "travel_airpeace"),
+        Rule(["ARIK AIR"], "Travel Expenses", "expense", 0.90, "travel_arik"),
+        Rule(["DANA AIR"], "Travel Expenses", "expense", 0.90, "travel_dana"),
+        Rule(["UNITED AIRLINES"], "Travel Expenses", "expense", 0.90, "travel_united"),
+        Rule(["ETHIOPIAN AIRLINES"], "Travel Expenses", "expense", 0.90, "travel_ethiopian"),
+        Rule(["FLIGHT TICKET", "AIRLINE TICKET", "AVIATION FUEL"], "Travel Expenses", "expense", 0.88, "travel_flight_generic"),
+        Rule(["NIGERIAN RAILWAY", "NRC TICKET"], "Travel Expenses", "expense", 0.88, "travel_rail"),
+        Rule(["HOTEL", "LODGING", "ACCOMMODATION"], "Travel Expenses", "expense", 0.80, "travel_hotel", direction="debit"),
+
+        # ═══ RENT — ADDITIONAL ═══
+        Rule(["GROUND RENT"], "Annual Rent", "expense", 0.85, "rent_ground", direction="debit"),
+        Rule(["FACILITY MANAGEMENT"], "Repairs and Maintenance", "expense", 0.80, "rent_facility_mgmt", direction="debit"),
+        Rule(["LAND USE CHARGE", "LAND CHARGE"], "Legal and Professional Fees", "expense", 0.85, "legal_land_charge"),
+        Rule(["CERTIFICATE OF OCCUPANCY", "C OF O"], "Legal and Professional Fees", "expense", 0.88, "legal_coo"),
+
+        # ═══ SALARY / EMPLOYMENT INCOME — ADDITIONAL ═══
+        Rule(["THIRTEENTH MONTH", "13TH MONTH"], "Income", "income", 0.90, "salary_13th", direction="credit"),
+        Rule(["LEAVE ALLOWANCE", "LEAVE BONUS"], "Income", "income", 0.90, "salary_leave", direction="credit"),
+        Rule(["BONUS PAYMENT", "PERFORMANCE BONUS"], "Income", "income", 0.88, "salary_bonus", direction="credit"),
+        Rule(["GRATUITY PAYMENT"], "Income", "income", 0.88, "salary_gratuity", direction="credit"),
+        Rule(["SEVERANCE PAY", "REDUNDANCY PAY"], "Income", "income", 0.88, "salary_severance", direction="credit"),
+        Rule(["NYSC ALLOWANCE"], "Income", "income", 0.90, "income_nysc", direction="credit"),
+
+        # ═══ BUSINESS INCOME — ADDITIONAL ═══
+        Rule(["RETAINER FEE", "RETAINER PAYMENT"], "Consulting Income", "income", 0.88, "income_retainer", direction="credit"),
+        Rule(["PROFESSIONAL FEE"], "Consulting Income", "income", 0.85, "income_professional_fee", direction="credit"),
+        Rule(["ROYALTY PAYMENT", "ROYALTY CREDIT"], "Income", "income", 0.85, "income_royalty", direction="credit"),
+        Rule(["DIVIDEND PAYMENT", "DIVIDEND CREDIT", "DIV PAYMENT"], "Dividend Income", "income", 0.93, "income_dividend", direction="credit"),
+        Rule(["STANBIC IBTC NOMINEES", "MERISTEM", "CORONATION SECURITIES"], "Dividend Income", "income", 0.88, "income_dividend_broker", direction="credit"),
+
+        # ═══ DRAWINGS — FOOD / PERSONAL (ADDITIONAL) ═══
+        Rule(["PIZZA HUT"], "Drawings", "expense", 0.90, "personal_pizzahut"),
+        Rule(["BURGER KING"], "Drawings", "expense", 0.90, "personal_burgerking"),
+        Rule(["SUBWAY"], "Drawings", "expense", 0.88, "personal_subway"),
+        Rule(["DEBONAIRS"], "Drawings", "expense", 0.90, "personal_debonairs"),
+        Rule(["TASTEE FRIED CHICKEN", "TFC"], "Drawings", "expense", 0.88, "personal_tfc"),
+        Rule(["BARCELOS"], "Drawings", "expense", 0.90, "personal_barcelos"),
+        Rule(["CRUNCHIES"], "Drawings", "expense", 0.88, "personal_crunchies"),
+        Rule(["CAFE NEO"], "Drawings", "expense", 0.88, "personal_cafneo"),
+        Rule(["MORNING SIDE CAFE", "MORNINGSIDE"], "Drawings", "expense", 0.88, "personal_morningside"),
+        Rule(["PRINCE EBEANO"], "Drawings", "expense", 0.88, "personal_ebeano"),
+        Rule(["HUBMART"], "Drawings", "expense", 0.88, "personal_hubmart"),
+        Rule(["NEXT SUPERMARKET"], "Drawings", "expense", 0.88, "personal_next_supermarket"),
+        Rule(["MARKET SQUARE"], "Drawings", "expense", 0.85, "personal_market_square"),
+        Rule(["HEALTH PLUS PHARMACY", "HEALTH PLUS"], "Drawings", "expense", 0.85, "personal_healthplus"),
+        Rule(["MED PLUS", "MEDPLUS"], "Drawings", "expense", 0.85, "personal_medplus"),
+        Rule(["ALPHA PHARMACY"], "Drawings", "expense", 0.85, "personal_alpha_pharmacy"),
+
+        # ═══ STREAMING / ENTERTAINMENT (ADDITIONAL) ═══
+        Rule(["AUDIOMACK"], "Drawings", "expense", 0.90, "personal_audiomack"),
+        Rule(["BOOMPLAY"], "Drawings", "expense", 0.90, "personal_boomplay"),
+        Rule(["CANAL PLUS", "CANAL+"], "Utilities", "expense", 0.90, "util_canalplus"),
+        Rule(["DISNEY PLUS", "DISNEY+"], "Drawings", "expense", 0.88, "personal_disney"),
+        Rule(["APPLE TV"], "Drawings", "expense", 0.88, "personal_appletv"),
+        Rule(["BET9JA", "SPORTYBET", "1XBET", "NAIRABET"], "Drawings", "expense", 0.75, "personal_betting",
+             direction="debit"),
+
+        # ═══ ONLINE SHOPPING (ADDITIONAL) ═══
+        Rule(["AMAZON"], "Drawings", "expense", 0.75, "personal_amazon_shop", direction="debit",
+             exclude_keywords=["AMAZON PRIME", "AMAZON WEB"]),
+        Rule(["ALIEXPRESS"], "Drawings", "expense", 0.80, "personal_aliexpress", direction="debit"),
+        Rule(["JIJI"], "Drawings", "expense", 0.75, "personal_jiji", direction="debit"),
+
+        # ═══ INVESTMENTS (ADDITIONAL) ═══
+        Rule(["WEALTH.NG", "WEALTHNG"], "Investment Income", "income", 0.82, "invest_wealthng", direction="credit"),
+        Rule(["AFRINVEST"], "Investment Income", "income", 0.82, "invest_afrinvest", direction="credit"),
+        Rule(["STANBIC IBTC ASSET"], "Investment Income", "income", 0.82, "invest_stanbic_asset", direction="credit"),
+        Rule(["ARM INVESTMENT", "ARM FUNDS"], "Investment Income", "income", 0.82, "invest_arm", direction="credit"),
+        Rule(["NORRENBERGER"], "Investment Income", "income", 0.80, "invest_norrenberger", direction="credit"),
+        Rule(["TREASURY BILL", "TBILL", "T-BILL"], "Investment Income", "income", 0.88, "invest_tbill_in", direction="credit"),
+        Rule(["FGN BOND", "FGN SAVINGS BOND"], "Investment Income", "income", 0.90, "invest_fgn_bond_in", direction="credit"),
+        Rule(["FIXED DEPOSIT", "TERM DEPOSIT"], "Investment Income", "income", 0.85, "invest_fixed_deposit", direction="credit"),
+        Rule(["TREASURY BILL", "TBILL", "T-BILL"], "Drawings", "expense", 0.85, "invest_tbill_out", direction="debit"),
+        Rule(["FGN BOND", "FGN SAVINGS BOND"], "Drawings", "expense", 0.85, "invest_fgn_bond_out", direction="debit"),
+        Rule(["FIXED DEPOSIT PLACEMENT", "TERM DEPOSIT PLACEMENT"], "Drawings", "expense", 0.85, "invest_fd_out", direction="debit"),
+
+        # ═══ CRYPTO (ADDITIONAL) ═══
+        Rule(["NOONES"], "Crypto Trading Income", "income", 0.78, "crypto_noones_in", direction="credit"),
+        Rule(["YELLOW CARD"], "Crypto Trading Income", "income", 0.78, "crypto_yellowcard_in", direction="credit"),
+        Rule(["OBIEX"], "Crypto Trading Income", "income", 0.78, "crypto_obiex_in", direction="credit"),
+        Rule(["BUYCOINS"], "Crypto Trading Income", "income", 0.78, "crypto_buycoins_in", direction="credit"),
+        Rule(["NOONES"], "Crypto Trading Cost", "expense", 0.78, "crypto_noones_out", direction="debit"),
+        Rule(["YELLOW CARD"], "Crypto Trading Cost", "expense", 0.78, "crypto_yellowcard_out", direction="debit"),
+        Rule(["OBIEX"], "Crypto Trading Cost", "expense", 0.78, "crypto_obiex_out", direction="debit"),
+        Rule(["BUYCOINS"], "Crypto Trading Cost", "expense", 0.78, "crypto_buycoins_out", direction="debit"),
+
+        # ═══ INSURANCE (ADDITIONAL) ═══
+        Rule(["MUTUAL BENEFITS"], "Insurance", "expense", 0.93, "insurance_mutual"),
+        Rule(["NEM INSURANCE"], "Insurance", "expense", 0.93, "insurance_nem"),
+        Rule(["SOVEREIGN TRUST"], "Insurance", "expense", 0.93, "insurance_sovereign"),
+        Rule(["ZENITH INSURANCE"], "Insurance", "expense", 0.93, "insurance_zenith"),
+        Rule(["CONSOLIDATED HALLMARK"], "Insurance", "expense", 0.93, "insurance_hallmark"),
+        Rule(["REGENCY ALLIANCE"], "Insurance", "expense", 0.93, "insurance_regency"),
+        Rule(["MOTOR INSURANCE", "COMPREHENSIVE INSURANCE", "THIRD PARTY INSURANCE"], "Insurance", "expense", 0.90, "insurance_motor"),
+        Rule(["HEALTH INSURANCE PREMIUM"], "Health Insurance", "expense", 0.93, "insurance_health_premium"),
+
+        # ═══ GOVERNMENT / LEGAL (ADDITIONAL) ═══
+        Rule(["NAFDAC"], "Legal and Professional Fees", "expense", 0.88, "legal_nafdac"),
+        Rule(["NIPC", "NOTAP"], "Legal and Professional Fees", "expense", 0.88, "legal_nipc"),
+        Rule(["TRADEMARK REGISTRATION", "PATENT FEE"], "Legal and Professional Fees", "expense", 0.88, "legal_trademark"),
+        Rule(["NOTARY FEE"], "Legal and Professional Fees", "expense", 0.88, "legal_notary"),
+
+        # ═══ EDUCATION (ADDITIONAL) ═══
+        Rule(["STUDY ABROAD", "INTERNATIONAL SCHOOL"], "Training", "expense", 0.82, "edu_international"),
+        Rule(["PROFESSIONAL CERTIFICATION", "CFA", "ACCA", "ICAN FEE", "CITN", "CIBN"], "Training", "expense", 0.88, "edu_professional_cert"),
+        Rule(["COURSERA"], "Training", "expense", 0.88, "edu_coursera"),
+        Rule(["UDEMY"], "Training", "expense", 0.88, "edu_udemy"),
+        Rule(["LINKEDIN LEARNING"], "Training", "expense", 0.88, "edu_linkedin_learning"),
+
+        # ═══ SOFTWARE SUBSCRIPTIONS (ADDITIONAL) ═══
+        Rule(["GITHUB"], "Subscriptions", "expense", 0.90, "sub_github"),
+        Rule(["GITLAB"], "Subscriptions", "expense", 0.90, "sub_gitlab"),
+        Rule(["FIGMA"], "Subscriptions", "expense", 0.90, "sub_figma"),
+        Rule(["HUBSPOT"], "Subscriptions", "expense", 0.88, "sub_hubspot"),
+        Rule(["SALESFORCE"], "Subscriptions", "expense", 0.88, "sub_salesforce"),
+        Rule(["MAILCHIMP"], "Subscriptions", "expense", 0.88, "sub_mailchimp"),
+        Rule(["SENDGRID"], "Subscriptions", "expense", 0.88, "sub_sendgrid"),
+        Rule(["AWS", "AMAZON WEB SERVICES"], "Subscriptions", "expense", 0.88, "sub_aws"),
+        Rule(["GOOGLE CLOUD"], "Subscriptions", "expense", 0.88, "sub_gcloud"),
+        Rule(["MICROSOFT AZURE", "AZURE SUBSCRIPTION"], "Subscriptions", "expense", 0.88, "sub_azure"),
+        Rule(["SHOPIFY"], "Subscriptions", "expense", 0.88, "sub_shopify"),
+        Rule(["ATLASSIAN", "JIRA"], "Subscriptions", "expense", 0.88, "sub_atlassian"),
+        Rule(["DROPBOX"], "Subscriptions", "expense", 0.88, "sub_dropbox"),
+        Rule(["INTERCOM"], "Subscriptions", "expense", 0.88, "sub_intercom"),
+        Rule(["ZENDESK"], "Subscriptions", "expense", 0.88, "sub_zendesk"),
+
+        # ═══ ADVERTISING ═══
+        Rule(["GOOGLE ADS", "GOOGLE ADWORDS"], "Advertising", "expense", 0.93, "ads_google"),
+        Rule(["FACEBOOK ADS", "META ADS"], "Advertising", "expense", 0.93, "ads_facebook"),
+        Rule(["INSTAGRAM ADS"], "Advertising", "expense", 0.93, "ads_instagram"),
+        Rule(["TWITTER ADS", "X ADS"], "Advertising", "expense", 0.90, "ads_twitter"),
+        Rule(["TIKTOK ADS", "TIKTOK FOR BUSINESS"], "Advertising", "expense", 0.90, "ads_tiktok"),
+        Rule(["INFLUENCER PAYMENT"], "Advertising", "expense", 0.80, "ads_influencer", direction="debit"),
+
+        # ═══ REPAIRS AND MAINTENANCE ═══
+        Rule(["GENERATOR REPAIR", "GENERATOR MAINTENANCE", "GENERATOR SERVICE"], "Repairs and Maintenance", "expense", 0.88, "repair_generator"),
+        Rule(["AC REPAIR", "AIR CONDITION REPAIR", "HVAC"], "Repairs and Maintenance", "expense", 0.88, "repair_ac"),
+        Rule(["PLUMBER", "PLUMBING"], "Repairs and Maintenance", "expense", 0.85, "repair_plumbing"),
+        Rule(["ELECTRICIAN"], "Repairs and Maintenance", "expense", 0.82, "repair_electrician", direction="debit"),
+        Rule(["BUILDING REPAIR", "PROPERTY MAINTENANCE", "PROPERTY REPAIR"], "Repairs and Maintenance", "expense", 0.85, "repair_building"),
+
+        # ═══ STATIONERY ═══
+        Rule(["OFFICE SUPPLIES", "STATIONERY PURCHASE"], "Stationery", "expense", 0.85, "stat_generic"),
+        Rule(["PRINTOUT", "PRINTING"], "Stationery", "expense", 0.80, "stat_printing", direction="debit"),
+        Rule(["TONER", "INK CARTRIDGE", "PRINTER INK"], "Stationery", "expense", 0.88, "stat_toner"),
+        Rule(["PAPER PURCHASE", "REAMS OF PAPER"], "Stationery", "expense", 0.85, "stat_paper"),
+
+        # ═══ OFFICE EQUIPMENT ═══
+        Rule(["FURNITURE PURCHASE", "OFFICE FURNITURE"], "Office Equipment", "expense", 0.85, "equip_furniture"),
+        Rule(["GENERATOR PURCHASE"], "Office Equipment", "expense", 0.85, "equip_generator"),
+        Rule(["AC UNIT", "AIR CONDITIONER PURCHASE"], "Office Equipment", "expense", 0.85, "equip_ac"),
+        Rule(["OFFICE CHAIR", "OFFICE TABLE", "OFFICE DESK"], "Office Equipment", "expense", 0.85, "equip_office_furniture"),
+
+        # ═══ COMPUTER EQUIPMENT ═══
+        Rule(["LAPTOP PURCHASE", "LAPTOP"], "Computer Equipment", "expense", 0.82, "it_laptop", direction="debit"),
+        Rule(["APPLE STORE"], "Computer Equipment", "expense", 0.82, "it_apple_store", direction="debit"),
+        Rule(["DELL", "HP LAPTOP", "LENOVO", "MACBOOK"], "Computer Equipment", "expense", 0.80, "it_laptop_brand", direction="debit"),
+        Rule(["IPHONE PURCHASE", "SAMSUNG PURCHASE"], "Computer Equipment", "expense", 0.78, "it_phone", direction="debit"),
+
+        # ═══ DONATIONS ═══
+        Rule(["DONATION", "CHARITABLE DONATION"], "Donations", "expense", 0.85, "donation_generic", direction="debit"),
+        Rule(["TITHE", "OFFERING"], "Donations", "expense", 0.82, "donation_tithe", direction="debit"),
+        Rule(["CHURCH PAYMENT", "MOSQUE PAYMENT"], "Donations", "expense", 0.78, "donation_worship", direction="debit"),
+        Rule(["ZAKAT"], "Donations", "expense", 0.88, "donation_zakat", direction="debit"),
+
+        # ═══ LOAN PLATFORMS (ADDITIONAL) ═══
+        Rule(["AELLA CREDIT", "AELLA"], "Interest on Loans", "expense", 0.82, "loan_aella", direction="debit"),
+        Rule(["KUDA LOAN"], "Interest on Loans", "expense", 0.82, "loan_kuda", direction="debit"),
+        Rule(["OPAY LOAN"], "Interest on Loans", "expense", 0.82, "loan_opay", direction="debit"),
+        Rule(["MIGO"], "Interest on Loans", "expense", 0.80, "loan_migo", direction="debit"),
+        Rule(["QUICKCHECK"], "Interest on Loans", "expense", 0.80, "loan_quickcheck", direction="debit"),
+        Rule(["CREDITVILLE"], "Interest on Loans", "expense", 0.80, "loan_creditville", direction="debit"),
+        Rule(["SPECTA"], "Interest on Loans", "expense", 0.80, "loan_specta", direction="debit"),
+        Rule(["NIRSAL MFB", "NIRSAL LOAN"], "Interest on Loans", "expense", 0.82, "loan_nirsal", direction="debit"),
+        Rule(["BOI LOAN", "BANK OF INDUSTRY"], "Interest on Loans", "expense", 0.82, "loan_boi", direction="debit"),
+        Rule(["CBN LOAN", "CBN INTERVENTION"], "Income", "income", 0.78, "loan_cbn_in", direction="credit"),
+
+        # ═══ CAPITAL GAINS ═══
+        Rule(["CAPITAL GAIN", "ASSET SALE PROCEED", "PROPERTY SALE PROCEED"], "Capital Gains Income", "income", 0.82, "capgain_income", direction="credit"),
+        Rule(["ASSET PURCHASE", "PROPERTY PURCHASE"], "Capital Gains Cost", "expense", 0.80, "capgain_cost", direction="debit"),
+    ]
+
+    def classify(
+        self, narration: str, direction: str, amount: float
+    ) -> Optional[ClassifyResult]:
+        """Match transaction against all rules. First match wins."""
+        for rule in self.RULES:
+            if rule.matches(narration, direction, amount):
+                return ClassifyResult(
+                    category=rule.category,
+                    type=rule.type,
+                    confidence=rule.confidence,
+                    source=ClassificationSource.RULE,
+                    needs_review=rule.confidence < 0.80,
+                    counterparty=None,
+                    explanation=f"Rule match: {rule.rule_name}",
+                    rule_hit=rule.rule_name,
+                )
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 4: LLM BATCH CLASSIFIER
+# ═══════════════════════════════════════════════════════════════
+
+class LLMClassifier:
+    """
+    Batch classification using LLM (Claude or GPT).
+    Only called for transactions that Layer 1-3 couldn't classify.
+
+    For testing: set api_key=None to use mock responses.
+    For production: provide Anthropic API key.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "claude-sonnet-4-20250514",
+        provider: str = "anthropic",  # "anthropic" or "openai"
+        batch_size: int = 20,
+        account_name: str = "",
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.provider = provider
+        self.batch_size = batch_size
+        self.account_name = account_name
+
+    def _build_prompt(
+        self, transactions: List[dict], category_labels: List[str]
+    ) -> str:
+        """Build the classification prompt."""
+        tx_lines = []
+        for i, tx in enumerate(transactions):
+            tx_lines.append(
+                f"{i+1}. {tx['direction'].upper()} | "
+                f"NGN {tx['amount']:,.2f} | "
+                f"{tx.get('date', 'N/A')} | "
+                f"\"{tx['narration']}\""
+            )
+
+        account_context = (
+            f"Account holder: {self.account_name}\n"
+            f"Any transaction where the counterparty name closely matches \"{self.account_name}\" is a Transfer, not Income or Drawings."
+            if self.account_name else
+            "Account holder name not provided."
+        )
+
+        return f"""You are classifying Nigerian bank transactions for a tax application called SettleTax.
+The account holder is a Nigerian individual or business. All transactions are in Nigerian Naira (NGN).
+
+For each transaction, assign:
+1. "category" — MUST be one of these exact labels: {json.dumps(category_labels)}
+2. "type" — either "income" or "expense"
+3. "confidence" — 0.0 to 1.0 (how sure you are)
+4. "explanation" — brief reason (under 15 words)
+
+\u2550\u2550\u2550 ACCOUNT HOLDER \u2550\u2550\u2550
+{account_context}
+
+\u2550\u2550\u2550 DIRECTION RULES \u2550\u2550\u2550
+- DEBIT = money leaving the account \u2192 usually "expense" or "Transfer"
+- CREDIT = money entering the account \u2192 usually "income" or "Transfer"
+
+\u2550\u2550\u2550 TRANSFER vs INCOME vs DRAWINGS \u2550\u2550\u2550
+- Transfer: ONLY when money moves between the SAME person's own accounts (same owner, different banks)
+- If money comes FROM a business or employer \u2192 Income
+- If money goes TO a vendor, merchant, or service \u2192 the appropriate expense category
+- If money goes TO a person for a service rendered \u2192 Legal and Professional Fees or Salaries and Wages
+- If money goes TO a person with no clear purpose \u2192 Transfer (flag for review, confidence \u2264 0.65)
+- Inter-bank NIP transfers to/from a person's name only \u2192 Transfer at low confidence (\u2264 0.65)
+
+\u2550\u2550\u2550 INCOME SUBCATEGORY RULES \u2550\u2550\u2550
+- "Income" \u2192 regular salary, wages, or general business revenue (use when unsure between income types)
+- "PAYE Income" \u2192 ONLY for tax deductions paid to FIRS/state revenue \u2014 ALWAYS expense, never income
+- "Consulting Income" \u2192 one-off professional fees, freelance payments, retainers received
+- "Commission Income" \u2192 sales commission received
+- "Dividend Income" \u2192 dividend payments from shares/stocks
+- "Investment Income" \u2192 returns/withdrawals from investment platforms (Risevest, Cowrywise, etc.)
+- "Bank Interest Received" \u2192 interest credited by the bank on savings or fixed deposit
+- "Annual Rent" (income) \u2192 rent received from a tenant \u2014 credit direction only
+- If a credit narration mentions a company name + PAYMENT or SALARY \u2192 Income
+- If a credit mentions INTEREST \u2192 Bank Interest Received
+- If a credit mentions DIVIDEND \u2192 Dividend Income
+
+\u2550\u2550\u2550 EXPENSE SUBCATEGORY RULES \u2550\u2550\u2550
+- "Motor Running Expenses" \u2192 vehicle running costs: ride-hailing, vehicle repairs, tyres, road worthiness
+- "Repairs and Maintenance" \u2192 building/property/equipment repairs (NOT vehicle)
+- "Office Equipment" \u2192 one-off purchase of physical office items (furniture, generator, AC unit)
+- "Computer Equipment" \u2192 laptops, phones, tablets, IT hardware
+- "Stationery" \u2192 consumable office supplies: paper, ink, printing
+- "Subscriptions" \u2192 recurring software/platform fees (GitHub, Zoom, Shopify, AWS, Canva)
+- "Advertising" \u2192 paid digital or print ads (Google Ads, Facebook Ads, influencer payments)
+- "Legal and Professional Fees" \u2192 lawyers, accountants, CAC, NAFDAC, trademark, notary fees
+- "Training" \u2192 school fees, exams (WAEC/JAMB/ICAN/ACCA), courses, certifications
+- "Donations" \u2192 tithe, offering, zakat, charitable payments
+- "Drawings" \u2192 personal spending NOT related to business (food, personal shopping, streaming, betting)
+- "Bank Charges" \u2192 any fee charged BY the bank (NIP fee, stamp duty, VAT on transfer, card fee, SMS alert)
+- "Interest on Loans" \u2192 loan repayments to any lender (bank or fintech)
+- "Pension" \u2192 pension contributions to a PFA
+- "National Housing Fund" \u2192 NHF contributions only
+- "Health Insurance" \u2192 NHIS or HMO premium payments
+- "Life Assurance Premium" \u2192 life insurance payments (AIICO, AXA Mansard, Leadway life products)
+
+\u2550\u2550\u2550 NIGERIAN MERCHANT CONTEXT \u2550\u2550\u2550
+Electricity: IKEDC/Ikeja Electric, EKEDC/Eko Electric, IBEDC, AEDC, EEDC, BEDC, KEDCO, PHEDC, NEPA, PHCN \u2192 Utilities
+Cable TV: DSTV, GOtv, StarTimes, Multichoice \u2192 Utilities (NOT Subscriptions)
+Fuel stations: Oando, Total Energies, MRS Oil, Conoil, Ardova, Nipco, 11 PLC \u2192 Fuel
+Ride-hailing: Bolt, Uber, InDrive, LagRide \u2192 Motor Running Expenses
+Telecom/ISP: MTN, Glo, Airtel, 9mobile, Spectranet, Smile, IPNX \u2192 Telephone
+Exam bodies: WAEC, JAMB, NECO \u2192 Training
+Tax agencies: FIRS, LIRS, RIRS, OGSIRS, KIRS and all state internal revenue services \u2192 PAYE Income (expense)
+Insurance: AIICO, AXA Mansard, Leadway, Custodian, Heirs, NEM, Sovereign Trust \u2192 Insurance or Life Assurance Premium
+Pension: ARM Pension, Stanbic IBTC Pension, Premium Pension, AIICO Pension, PAL Pensions \u2192 Pension
+Lending apps: Carbon, Fairmoney, Branch, Renmoney, PalmCredit, Aella, Migo, Specta \u2192 Interest on Loans (debit)
+Investment apps: Risevest, Cowrywise, PiggyVest, Bamboo, Trove, Chaka, Wealth.ng \u2192 Investment Income (credit) / Drawings (debit)
+Crypto platforms: Binance, Luno, Quidax, Bybit, Yellow Card, Obiex, Noones \u2192 Crypto Trading Income (credit) / Crypto Trading Cost (debit)
+Streaming: Netflix, Spotify, Apple Music, YouTube Premium, Audiomack, Boomplay \u2192 Drawings
+Cloud/Software: AWS, Google Cloud, Azure, GitHub, Figma, Shopify, Zoom, Slack, Canva \u2192 Subscriptions
+Advertising: Google Ads, Facebook Ads, Meta Ads, TikTok Ads \u2192 Advertising
+Supermarkets: Shoprite, Spar, Game Stores, Prince Ebeano, Hubmart, Next Supermarket \u2192 Drawings
+Restaurants/Food: Chicken Republic, Dominos, KFC, Sweet Sensation, Mr Biggs, Tantalizers, The Place, Pizza Hut, Burger King \u2192 Drawings
+
+\u2550\u2550\u2550 NARRATION PATTERN GUIDE \u2550\u2550\u2550
+- "NIP TRANSFER TO {NAME}" \u2192 Transfer if name matches account holder, else Transfer at low confidence
+- "NIP TRANSFER FROM {NAME}" \u2192 Transfer if name matches account holder, else Income at low confidence
+- "SALARY CREDIT", "PAYROLL", "MONTHLY SALARY" \u2192 Income
+- "TRF/{REF}/{NAME}" or "TRF-{NAME}" \u2192 Transfer, confidence depends on name match
+- "REVERSAL", "RVS", "REFUND", "RETURNED" \u2192 Transfer (reversed transaction)
+- "LOAN DISBURSEMENT" from fintech \u2192 Income at low confidence (may be loan, flag for review)
+- "POS PURCHASE", "WEB DEBIT" \u2192 Drawings (card purchase, personal)
+- "COMMISSION" on a credit \u2192 Commission Income
+- "BONUS", "LEAVE ALLOWANCE", "GRATUITY" on a credit \u2192 Income
+- "DIVIDEND" on a credit \u2192 Dividend Income
+- "INTEREST" on a credit \u2192 Bank Interest Received
+- "INTEREST" on a debit \u2192 Interest on Loans
+
+\u2550\u2550\u2550 AMOUNT SIGNALS \u2550\u2550\u2550
+- NGN 50 bare debit with no clear narration \u2192 Bank Charges (stamp duty)
+- NGN 10, 25, or 50 debit with NIP/TRANSFER in narration \u2192 Bank Charges (NIP fee)
+- NGN 4 or 52 debit with SMS/ALERT \u2192 Bank Charges (SMS alert)
+- NGN 35 debit with ATM keyword \u2192 Bank Charges (ATM fee)
+- NGN 1.25 or 3.75 debit \u2192 Bank Charges (VAT on NIP fee)
+- Very large credits (NGN 100,000+) with a person's name \u2192 likely Income or Transfer, not Drawings
+
+\u2550\u2550\u2550 BUSINESS vs PERSONAL (DRAWINGS) \u2550\u2550\u2550
+Use "Drawings" when the spend is clearly personal:
+- Restaurants, fast food, cafes, supermarket/grocery shopping
+- Personal streaming (Netflix, Spotify, Audiomack)
+- Personal clothing/fashion, pharmacies
+- Betting and gambling platforms (Bet9ja, SportyBet, 1xBet)
+- Personal travel (holidays, personal flights)
+Use the appropriate business category when spend is work-related:
+- Office/shop rent \u2192 Office Rent | Internet for office \u2192 Telephone
+- Business travel \u2192 Travel Expenses | Staff salaries \u2192 Salaries and Wages
+- Equipment for business \u2192 Office Equipment or Computer Equipment
+
+\u2550\u2550\u2550 COMMON MISTAKES TO AVOID \u2550\u2550\u2550
+- DSTV, GOtv, StarTimes \u2192 Utilities NOT Subscriptions
+- PAYE deduction \u2192 expense NOT income (despite the word "income" in the category name)
+- Pension contribution \u2192 Pension NOT Insurance
+- NHF contribution \u2192 National Housing Fund NOT Pension
+- Loan repayment debit \u2192 Interest on Loans NOT Bank Charges
+- Loan disbursement credit \u2192 Income at low confidence (flag for review)
+- Stamp duty (NGN 50 debit) \u2192 Bank Charges NOT Drawings
+- Crypto purchase debit \u2192 Crypto Trading Cost NOT Drawings
+- Investment platform debit \u2192 Drawings (personal savings) NOT Subscriptions
+- Airtime/data purchase \u2192 Telephone NOT Subscriptions
+- Carbon/Fairmoney debit \u2192 Interest on Loans NOT Bank Charges
+- Generator diesel \u2192 Fuel NOT Utilities
+- Generator repair \u2192 Repairs and Maintenance NOT Office Equipment
+- Generator purchase \u2192 Office Equipment NOT Repairs and Maintenance
+- School fees \u2192 Training NOT Drawings
+- Church/mosque/tithe payment \u2192 Donations NOT Drawings
+- Annual Rent on a credit \u2192 income type, NOT expense
+
+\u2550\u2550\u2550 CONFIDENCE GUIDANCE \u2550\u2550\u2550
+- 0.95\u20131.00: Completely unambiguous (e.g. "DSTV SUBSCRIPTION", "MTN AIRTIME PURCHASE")
+- 0.80\u20130.94: Clear but slightly ambiguous
+- 0.60\u20130.79: Best guess \u2014 category is plausible but not certain
+- Below 0.60: Genuinely unclear \u2014 will be flagged for user review
+Always use confidence \u2264 0.65 for:
+- Narration is only a person's name with no other context
+- Narration is only a reference number or is blank
+- Transfer to/from a person where purpose is unknown
+- "POS PURCHASE" with no merchant name
+- Generic "PAYMENT" or "TRANSFER" with no other context
+
+\u2550\u2550\u2550 FEW-SHOT EXAMPLES \u2550\u2550\u2550
+DEBIT | NGN 5,000 | "MTN AIRTIME VTU PURCHASE" \u2192 Telephone / expense / 0.97
+CREDIT | NGN 450,000 | "SALARY CREDIT - ACME LTD" \u2192 Income / income / 0.95
+DEBIT | NGN 50 | "NIBSS STAMP DUTY" \u2192 Bank Charges / expense / 0.99
+DEBIT | NGN 120,000 | "OFFICE RENT - JUNE 2024" \u2192 Office Rent / expense / 0.93
+CREDIT | NGN 80,000 | "RENT PAYMENT FROM EMEKA OKAFOR" \u2192 Annual Rent / income / 0.88
+DEBIT | NGN 2,500 | "BOLT RIDE - LAGOS" \u2192 Motor Running Expenses / expense / 0.95
+DEBIT | NGN 15,000 | "PAYE DEDUCTION - MAY 2024" \u2192 PAYE Income / expense / 0.97
+CREDIT | NGN 10,000 | "NIP TRANSFER FROM JOHN ADEYEMI" \u2192 Transfer / income / 0.60
+DEBIT | NGN 5,000 | "NIP TRANSFER TO JOHN ADEYEMI" \u2192 Transfer / expense / 0.60
+DEBIT | NGN 200,000 | "RISEVEST INVESTMENT" \u2192 Drawings / expense / 0.80
+CREDIT | NGN 215,000 | "RISEVEST WITHDRAWAL" \u2192 Investment Income / income / 0.82
+DEBIT | NGN 12,500 | "PAYE TAX - APRIL 2024 - ABC LTD" \u2192 PAYE Income / expense / 0.97
+DEBIT | NGN 33,000 | "NHF CONTRIBUTION - JUNE" \u2192 National Housing Fund / expense / 0.98
+DEBIT | NGN 15,000 | "ARM PENSION CONTRIBUTION" \u2192 Pension / expense / 0.98
+DEBIT | NGN 8,500 | "HYGEIA HMO PREMIUM" \u2192 Health Insurance / expense / 0.96
+CREDIT | NGN 25,000 | "RENT PAYMENT TUNDE BAKARE" \u2192 Annual Rent / income / 0.82
+DEBIT | NGN 45,000 | "FAIRMONEY LOAN REPAYMENT" \u2192 Interest on Loans / expense / 0.88
+CREDIT | NGN 50,000 | "FAIRMONEY LOAN DISBURSEMENT" \u2192 Income / income / 0.70
+DEBIT | NGN 3,500 | "BINANCE CRYPTO PURCHASE" \u2192 Crypto Trading Cost / expense / 0.90
+CREDIT | NGN 180,000 | "BINANCE WITHDRAWAL" \u2192 Crypto Trading Income / income / 0.85
+CREDIT | NGN 500,000 | "CONSULTING FEE - XYZ PROJECT" \u2192 Consulting Income / income / 0.88
+DEBIT | NGN 75,000 | "GOOGLE ADS - CAMPAIGN OCT" \u2192 Advertising / expense / 0.93
+DEBIT | NGN 18,000 | "AWS CLOUD SERVICES" \u2192 Subscriptions / expense / 0.92
+DEBIT | NGN 5,000 | "CHURCH OFFERING - RCCG" \u2192 Donations / expense / 0.85
+DEBIT | NGN 2,200 | "IKEDC PREPAID TOKEN" \u2192 Utilities / expense / 0.97
+DEBIT | NGN 1,500 | "SPECTRANET SUBSCRIPTION" \u2192 Telephone / expense / 0.93
+DEBIT | NGN 320,000 | "STAFF SALARY - JUNE 2024" \u2192 Salaries and Wages / expense / 0.92
+DEBIT | NGN 55,000 | "LAPTOP PURCHASE - SLOT" \u2192 Computer Equipment / expense / 0.85
+DEBIT | NGN 12,000 | "GENERATOR REPAIR - ABUJA" \u2192 Repairs and Maintenance / expense / 0.85
+CREDIT | NGN 200,000 | "NIP TRANSFER FROM ADAEZE OKONKWO" \u2192 Transfer / income / 0.60
+DEBIT | NGN 10 | "NIP FEE" \u2192 Bank Charges / expense / 0.99
+DEBIT | NGN 50 | "" \u2192 Bank Charges / expense / 0.75
+
+Transactions to classify:
+{chr(10).join(tx_lines)}
+
+Return ONLY a JSON array with one object per transaction, preserving the index number.
+Example: [{{"index":1,"category":"Fuel","type":"expense","confidence":0.9,"explanation":"Payment at Oando fuel station"}}]"""
+
+    def classify_batch(
+        self,
+        transactions: List[dict],
+        category_labels: List[str],
+    ) -> List[ClassifyResult]:
+        """
+        Classify a batch of transactions using the LLM.
+
+        For testing without an API key, returns UNCLASSIFIED results.
+        """
+        if not self.api_key:
+            # Mock mode — return unclassified results for testing
+            return [
+                ClassifyResult(
+                    category=None,
+                    type="expense" if tx.get("direction") == "debit" else "income",
+                    confidence=0.0,
+                    source=ClassificationSource.UNCLASSIFIED,
+                    needs_review=True,
+                    counterparty=None,
+                    explanation="No LLM API key provided (test mode)",
+                )
+                for tx in transactions
+            ]
+
+        prompt = self._build_prompt(transactions, category_labels)
+
+        try:
+            if self.provider == "anthropic":
+                return self._call_anthropic(prompt, transactions, category_labels)
+            else:
+                return self._call_openai(prompt, transactions, category_labels)
+        except Exception as e:
+            # On any error, return unclassified
+            return [
+                ClassifyResult(
+                    category=None,
+                    type="expense" if tx.get("direction") == "debit" else "income",
+                    confidence=0.0,
+                    source=ClassificationSource.UNCLASSIFIED,
+                    needs_review=True,
+                    counterparty=None,
+                    explanation=f"LLM error: {str(e)[:100]}",
+                )
+                for tx in transactions
+            ]
+
+    def _call_anthropic(
+        self, prompt: str, transactions: List[dict], category_labels: List[str]
+    ) -> List[ClassifyResult]:
+        """Call Anthropic Claude API."""
+        import requests
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": self.model,
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = data["content"][0]["text"]
+
+        return self._parse_llm_response(text, transactions, category_labels)
+
+    def _call_openai(
+        self, prompt: str, transactions: List[dict], category_labels: List[str]
+    ) -> List[ClassifyResult]:
+        """Call OpenAI API."""
+        import requests
+
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            json={
+                "model": self.model,
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": "You are a financial transaction classifier. Return valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = data["choices"][0]["message"]["content"]
+
+        return self._parse_llm_response(text, transactions, category_labels)
+
+    def _parse_llm_response(
+        self, text: str, transactions: List[dict], category_labels: List[str]
+    ) -> List[ClassifyResult]:
+        """Parse LLM JSON response into ClassifyResult list."""
+        # Extract JSON array from response
+        text = text.strip()
+        if not text.startswith("["):
+            # Try to find JSON array in the text
+            start = text.find("[")
+            end = text.rfind("]") + 1
+            if start >= 0 and end > start:
+                text = text[start:end]
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return [
+                ClassifyResult(
+                    category=None,
+                    type="expense" if tx.get("direction") == "debit" else "income",
+                    confidence=0.0,
+                    source=ClassificationSource.UNCLASSIFIED,
+                    needs_review=True,
+                    counterparty=None,
+                    explanation="Failed to parse LLM response",
+                )
+                for tx in transactions
+            ]
+
+        results = []
+        for i, tx in enumerate(transactions):
+            # Find the matching result by index
+            llm_result = None
+            for r in parsed:
+                if r.get("index") == i + 1:
+                    llm_result = r
+                    break
+
+            if llm_result and llm_result.get("category") in category_labels:
+                conf = float(llm_result.get("confidence", 0.5))
+                results.append(ClassifyResult(
+                    category=llm_result["category"],
+                    type=llm_result.get("type", "expense"),
+                    confidence=conf,
+                    source=ClassificationSource.LLM,
+                    needs_review=conf < 0.75,
+                    counterparty=None,
+                    explanation=llm_result.get("explanation", "LLM classified"),
+                ))
+            else:
+                results.append(ClassifyResult(
+                    category=None,
+                    type="expense" if tx.get("direction") == "debit" else "income",
+                    confidence=0.0,
+                    source=ClassificationSource.UNCLASSIFIED,
+                    needs_review=True,
+                    counterparty=None,
+                    explanation="LLM returned invalid category",
+                ))
+
+        return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# COUNTERPARTY EXTRACTOR
+# ═══════════════════════════════════════════════════════════════
+
+class CounterpartyExtractor:
+    """
+    Extracts the likely counterparty name from Nigerian bank narrations.
+    Works across multiple bank formats.
+    """
+
+    # Ordered by specificity (most specific patterns first)
+    PATTERNS = [
+        # PalmPay
+        (re.compile(r"NIP\s+TRANSFER\s+TO\s+(.+?)(?:\s*$)", re.I), "palmpay_to"),
+        (re.compile(r"NIP\s+TRANSFER\s+FROM\s+(.+?)(?:\s*$)", re.I), "nip_from"),
+        # Kuda / modern fintechs
+        (re.compile(r"TRANSFER\s+TO\s+(.+?)\s*(?:-\s*\S+)?$", re.I), "transfer_to"),
+        (re.compile(r"TRANSFER\s+FROM\s+(.+?)\s*(?:-\s*\S+)?$", re.I), "transfer_from"),
+        # TRF prefix (Access, GTB)
+        (re.compile(r"TRF[-/\s]+(.+?)(?:/\S|$)", re.I), "trf"),
+        # UBA style
+        (re.compile(r"^(.+?)/TRF/", re.I), "uba_trf"),
+        # Zenith
+        (re.compile(r"MC\s+TRANSFER:\s*\S+\s+(.+?)$", re.I), "zenith"),
+        # POS / Web purchase
+        (re.compile(r"(?:POS|WEB)\s+(?:PURCHASE|DEBIT)\s+(?:AT\s+)?(.+?)(?:\s+\d|$)", re.I), "pos"),
+    ]
+
+    CLEAN_SUFFIXES = [
+        " LTD", " LIMITED", " PLC", " INC", " LLC",
+    ]
+
+    @classmethod
+    def extract(cls, narration: str) -> Optional[str]:
+        """Extract counterparty name from narration."""
+        if not narration:
+            return None
+
+        text = narration.strip()
+
+        for pattern, _name in cls.PATTERNS:
+            match = pattern.search(text)
+            if match:
+                name = match.group(1).strip()
+                name = cls._clean_name(name)
+                if name and len(name) >= 2:
+                    return name
+
+        return None
+
+    @classmethod
+    def _clean_name(cls, name: str) -> str:
+        """Clean up extracted counterparty name."""
+        # Remove trailing numbers/refs
+        name = re.sub(r"\s+\d{6,}.*$", "", name)
+        # Remove trailing reference codes
+        name = re.sub(r"\s+REF\S*$", "", name, flags=re.I)
+        # Remove non-alphanumeric (keep spaces, hyphens, ampersands)
+        name = re.sub(r"[^A-Za-z\s\-&]", "", name)
+        # Normalize whitespace
+        name = re.sub(r"\s+", " ", name).strip()
+        return name
+
+
+# ═══════════════════════════════════════════════════════════════
+# NARRATION CACHE (Layer 0 — cross-user, cross-batch dedup)
+# ═══════════════════════════════════════════════════════════════
+
+class NarrationCache:
+    """
+    Global in-memory cache keyed by a normalized narration fingerprint.
+
+    Why this matters:
+    - 50 users × 500 txns = 25,000 transactions.
+    - A single "AIRTIME PURCHASE MTN" narration may appear hundreds of
+      times across all users. Without a cache, each one hits LLM.
+    - With this cache, LLM is called once; every subsequent identical
+      narration gets the cached result instantly.
+
+    Normalization strips digits and references so that:
+      "NIP TRANSFER TO JOHN 20250101 REF123456"  →  same key as
+      "NIP TRANSFER TO JOHN 20250215 REF789012"
+    Only cache high-confidence results (≥ 0.70) to avoid propagating
+    uncertain classifications.
+    """
+
+    def __init__(self, max_size: int = 50_000):
+        self._cache: Dict[str, "ClassifyResult"] = {}
+        self._max_size = max_size
+
+    def _key(self, narration: str, direction: str) -> str:
+        """Build a stable fingerprint from a narration + direction."""
+        # Collapse digit sequences (dates, refs, amounts embedded in text)
+        normalized = re.sub(r"\d+", "#", narration.upper().strip())
+        # Collapse whitespace
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return f"{direction}:{normalized}"
+
+    def get(self, narration: str, direction: str) -> Optional["ClassifyResult"]:
+        return self._cache.get(self._key(narration, direction))
+
+    def set(self, narration: str, direction: str, result: "ClassifyResult"):
+        # Only cache confident results to avoid spreading wrong classifications
+        if result.confidence < 0.70:
+            return
+        if len(self._cache) >= self._max_size:
+            # Evict oldest 10 % (dict preserves insertion order in Python 3.7+)
+            evict_count = self._max_size // 10
+            for k in list(self._cache.keys())[:evict_count]:
+                del self._cache[k]
+        self._cache[self._key(narration, direction)] = result
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def stats(self) -> dict:
+        return {"cached_narrations": len(self._cache), "max_size": self._max_size}
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN CLASSIFIER — ORCHESTRATES ALL 4 LAYERS
+# ═══════════════════════════════════════════════════════════════
+
+class SettleTaxClassifier:
+    """
+    Main classifier that runs all 4 layers in order.
+
+    Usage:
+        classifier = SettleTaxClassifier(
+            account_name="OBAFEMI-MOSES MOSINMILOLUWA",
+            account_names=["SETTLE TAX LTD"],
+        )
+
+        # Single transaction
+        result = classifier.classify_single(
+            narration="NIP TRANSFER TO JOHN ADEYEMI 12345",
+            amount=50000,
+            direction="debit",
+        )
+
+        # Batch (DataFrame)
+        results_df = classifier.classify_batch(tx_df)
+    """
+
+    def __init__(
+        self,
+        account_name: str,
+        account_names: List[str] = None,
+        user_history: Dict[str, dict] = None,
+        llm_api_key: Optional[str] = None,
+        llm_provider: str = "anthropic",
+        llm_model: str = "claude-sonnet-4-20250514",
+        shared_cache: Optional[NarrationCache] = None,
+    ):
+        self.structural = StructuralDetector(account_name, account_names)
+        self.history = UserHistoryMatcher(user_history)
+        self.rules = RuleEngine()
+        self.llm = LLMClassifier(
+            api_key=llm_api_key,
+            model=llm_model,
+            provider=llm_provider,
+            account_name=account_name,
+        )
+        self.counterparty_extractor = CounterpartyExtractor()
+
+        # Shared narration cache — pass the same instance across users to
+        # get cross-user deduplication (Layer 0).
+        self._cache: NarrationCache = shared_cache or NarrationCache()
+
+        # Stats tracking
+        self.stats = {
+            "total": 0,
+            "cache_hit": 0,      # Layer 0
+            "structural": 0,     # Layer 1
+            "user_history": 0,   # Layer 2
+            "rule": 0,           # Layer 3
+            "llm": 0,            # Layer 4
+            "unclassified": 0,
+        }
+
+    def classify_single(
+        self,
+        narration: str,
+        amount: float,
+        direction: str,  # "debit" or "credit"
+        date: str = "",
+    ) -> ClassifyResult:
+        """Classify a single transaction through all 4 layers."""
+        self.stats["total"] += 1
+
+        # Extract counterparty for all layers
+        counterparty = self.counterparty_extractor.extract(narration)
+
+        # ── Layer 0: Narration cache ──────────────────────────────────────────
+        # Fastest path: identical (or structurally identical) narration has
+        # been classified before — return cached result immediately.
+        cached = self._cache.get(narration, direction)
+        if cached:
+            # Re-use cached result but preserve this transaction's counterparty
+            from dataclasses import replace as dc_replace
+            result = dc_replace(cached, counterparty=cached.counterparty or counterparty)
+            self.stats["cache_hit"] += 1
+            return result
+
+        # ── Layer 1: Structural Detection ─────────────────────────────────────
+        result = self.structural.classify(narration, amount, direction)
+        if result:
+            result.counterparty = result.counterparty or counterparty
+            self.stats["structural"] += 1
+            self._cache.set(narration, direction, result)
+            return result
+
+        # ── Layer 2: User History ─────────────────────────────────────────────
+        result = self.history.classify(counterparty)
+        if result:
+            result.counterparty = counterparty
+            self.stats["user_history"] += 1
+            self._cache.set(narration, direction, result)
+            return result
+
+        # ── Layer 3: Rule Engine ──────────────────────────────────────────────
+        result = self.rules.classify(narration, direction, amount)
+        if result:
+            result.counterparty = counterparty
+            self.stats["rule"] += 1
+            self._cache.set(narration, direction, result)
+            return result
+
+        # ── Layer 4: Falls through — will be batched for LLM ─────────────────
+        self.stats["unclassified"] += 1
+        return ClassifyResult(
+            category=None,
+            type="expense" if direction == "debit" else "income",
+            confidence=0.0,
+            source=ClassificationSource.UNCLASSIFIED,
+            needs_review=True,
+            counterparty=counterparty,
+            explanation="No layer matched — needs LLM or user classification",
+        )
+
+    def classify_batch(self, df, llm_enabled: bool = True):
+        """
+        Classify an entire DataFrame of transactions.
+
+        Expected columns:
+        - Remarks (or narration): transaction description
+        - amount: transaction amount
+        - direction: "debit" or "credit"
+        - Trans_Date (optional): transaction date
+
+        Returns: DataFrame with added classification columns.
+        """
+        import pandas as pd
+
+        # Normalize column names
+        df = df.copy()
+        if "Remarks" in df.columns and "narration" not in df.columns:
+            df["narration"] = df["Remarks"]
+        if "Trans_Date" in df.columns and "date" not in df.columns:
+            df["date"] = df["Trans_Date"]
+
+        # Classify each transaction through layers 1-3
+        results = []
+        llm_queue = []  # transactions that need LLM
+
+        for idx, row in df.iterrows():
+            narration = str(row.get("narration", row.get("Remarks", "")))
+            amount = float(row.get("amount", 0))
+            direction = str(row.get("direction", "debit")).lower()
+            date = str(row.get("date", row.get("Trans_Date", "")))
+
+            result = self.classify_single(narration, amount, direction, date)
+
+            if result.source == ClassificationSource.UNCLASSIFIED and llm_enabled:
+                llm_queue.append({
+                    "df_idx": idx,
+                    "narration": narration,
+                    "amount": amount,
+                    "direction": direction,
+                    "date": date,
+                })
+                results.append((idx, None))  # placeholder
+            else:
+                results.append((idx, result))
+
+        # Layer 4: Batch LLM classification for unclassified
+        if llm_queue:
+            # ── Deduplication ────────────────────────────────────────────────
+            # Many transactions within the same 500-row batch share identical
+            # narration patterns (e.g., weekly DSTV payments, recurring airtime
+            # top-ups). Send each unique narration to LLM only once, then fan
+            # the result out to all matching rows.
+            unique_items: Dict[str, dict] = {}   # cache_key → first item
+            key_for: List[str] = []              # parallel to llm_queue
+            for item in llm_queue:
+                k = self._cache._key(item["narration"], item["direction"])
+                key_for.append(k)
+                if k not in unique_items:
+                    unique_items[k] = item
+
+            # Call LLM only for the unique narrations
+            all_categories = sorted(ALL_CATEGORIES)
+            llm_result_by_key: Dict[str, ClassifyResult] = {}
+            unique_list = list(unique_items.values())
+
+            for batch_start in range(0, len(unique_list), self.llm.batch_size):
+                batch = unique_list[batch_start:batch_start + self.llm.batch_size]
+                llm_results = self.llm.classify_batch(
+                    [{"narration": t["narration"], "amount": t["amount"],
+                      "direction": t["direction"], "date": t["date"]}
+                     for t in batch],
+                    all_categories,
+                )
+                for item, llm_result in zip(batch, llm_results):
+                    llm_result.counterparty = self.counterparty_extractor.extract(
+                        item["narration"]
+                    )
+                    k = self._cache._key(item["narration"], item["direction"])
+                    llm_result_by_key[k] = llm_result
+                    # Write to cache so this result is reused for future batches
+                    # and future users sharing the same shared_cache instance.
+                    self._cache.set(item["narration"], item["direction"], llm_result)
+
+            # Fan results back to every transaction in llm_queue
+            result_map_idx = {idx: j for j, (idx, _) in enumerate(results)}
+            for item, k in zip(llm_queue, key_for):
+                llm_result = llm_result_by_key.get(k)
+                if llm_result is None:
+                    continue
+                df_idx = item["df_idx"]
+                j = result_map_idx.get(df_idx)
+                if j is not None and results[j][1] is None:
+                    results[j] = (df_idx, llm_result)
+                    if llm_result.source == ClassificationSource.LLM:
+                        self.stats["llm"] += 1
+                        self.stats["unclassified"] -= 1
+
+        # Add results to DataFrame
+        result_map = {idx: r for idx, r in results}
+        df["st_category"] = df.index.map(lambda i: result_map[i].category if result_map.get(i) else None)
+        df["st_type"] = df.index.map(lambda i: result_map[i].type if result_map.get(i) else None)
+        df["st_confidence"] = df.index.map(lambda i: result_map[i].confidence if result_map.get(i) else 0)
+        df["st_source"] = df.index.map(lambda i: result_map[i].source.value if result_map.get(i) else "unclassified")
+        df["st_needs_review"] = df.index.map(lambda i: result_map[i].needs_review if result_map.get(i) else True)
+        df["st_counterparty"] = df.index.map(lambda i: result_map[i].counterparty if result_map.get(i) else None)
+        df["st_explanation"] = df.index.map(lambda i: result_map[i].explanation if result_map.get(i) else "")
+        df["st_rule_hit"] = df.index.map(lambda i: result_map[i].rule_hit if result_map.get(i) else None)
+
+        return df
+
+    def print_stats(self):
+        """Print classification statistics."""
+        total = self.stats["total"]
+        if total == 0:
+            print("No transactions classified yet.")
+            return
+
+        print(f"\n{'='*55}")
+        print(f"SettleTax Classification Results")
+        print(f"{'='*55}")
+        print(f"Total transactions: {total}")
+        print(f"  Layer 0 (Cache hit):     {self.stats['cache_hit']:>5} ({self.stats['cache_hit']/total*100:.1f}%)")
+        print(f"  Layer 1 (Structural):    {self.stats['structural']:>5} ({self.stats['structural']/total*100:.1f}%)")
+        print(f"  Layer 2 (User History):  {self.stats['user_history']:>5} ({self.stats['user_history']/total*100:.1f}%)")
+        print(f"  Layer 3 (Rules):         {self.stats['rule']:>5} ({self.stats['rule']/total*100:.1f}%)")
+        print(f"  Layer 4 (LLM):           {self.stats['llm']:>5} ({self.stats['llm']/total*100:.1f}%)")
+        print(f"  Unclassified:            {self.stats['unclassified']:>5} ({self.stats['unclassified']/total*100:.1f}%)")
+        print(f"  Cache size:              {len(self._cache):>5} entries")
+        print(f"{'='*55}")
+
+    def learn_from_user(
+        self, counterparty: str, category: str, tx_type: str
+    ):
+        """
+        Record a user's manual categorisation for future auto-matching.
+        Call this when a user confirms/overrides a category in the app.
+        """
+        if counterparty:
+            self.history.add_mapping(counterparty, category, tx_type, source="user")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MULTI-USER BATCH — optimised for many concurrent users
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def classify_batch_multi_user(
+        classifiers_and_dfs: List[tuple],
+        shared_cache: Optional[NarrationCache] = None,
+        llm_enabled: bool = True,
+        max_workers: int = 8,
+    ) -> List:
+        """
+        Classify transactions for MULTIPLE users in one optimised pass.
+
+        Call this instead of calling classify_batch() per-user when you
+        have many users' DataFrames arriving at the same time (e.g. 50
+        users each with 500 transactions = 25,000 rows).
+
+        Optimisations vs. calling classify_batch() in a loop:
+        1. Layers 1-3 run in parallel (ThreadPoolExecutor).
+        2. All LLM-needing transactions from EVERY user are collected,
+           deduplicated by narration fingerprint, and sent to the LLM in
+           the minimum number of API calls.
+        3. LLM results are written to the shared_cache so subsequent
+           requests (more users, next API call) benefit immediately.
+
+        Args:
+            classifiers_and_dfs: List of (SettleTaxClassifier, DataFrame)
+                                  tuples, one per user.
+            shared_cache:         A NarrationCache instance shared across all
+                                  classifiers. If None, one is created and
+                                  injected into every classifier.
+            llm_enabled:          Set False to skip LLM entirely.
+            max_workers:          Thread count for parallel Layers 1-3.
+
+        Returns:
+            List of classified DataFrames, in the same order as input.
+
+        Usage:
+            cache = NarrationCache()
+            classifiers = [
+                SettleTaxClassifier(account_name=u["name"], shared_cache=cache)
+                for u in users
+            ]
+            results = SettleTaxClassifier.classify_batch_multi_user(
+                list(zip(classifiers, user_dfs)),
+                shared_cache=cache,
+            )
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if shared_cache is None:
+            shared_cache = NarrationCache()
+
+        # Inject the shared cache into every classifier so Layer 0 works
+        # across all of them.
+        for classifier, _ in classifiers_and_dfs:
+            classifier._cache = shared_cache
+
+        n_users = len(classifiers_and_dfs)
+        # Slot to store per-user intermediate results
+        processed: List[Optional[tuple]] = [None] * n_users
+
+        # ── Phase 1: Layers 1-3 in parallel ──────────────────────────────────
+        def _run_layers_1_to_3(args):
+            """Run one user's transactions through layers 0-3, return LLM queue."""
+            user_idx, (classifier, df) = args
+            df = df.copy()
+            if "Remarks" in df.columns and "narration" not in df.columns:
+                df["narration"] = df["Remarks"]
+            if "Trans_Date" in df.columns and "date" not in df.columns:
+                df["date"] = df["Trans_Date"]
+
+            results = []
+            llm_queue = []
+
+            for idx, row in df.iterrows():
+                narration = str(row.get("narration", row.get("Remarks", "")))
+                amount = float(row.get("amount", 0))
+                direction = str(row.get("direction", "debit")).lower()
+                date = str(row.get("date", row.get("Trans_Date", "")))
+
+                result = classifier.classify_single(narration, amount, direction, date)
+
+                if result.source == ClassificationSource.UNCLASSIFIED and llm_enabled:
+                    llm_queue.append({
+                        "df_idx": idx,
+                        "narration": narration,
+                        "amount": amount,
+                        "direction": direction,
+                        "date": date,
+                    })
+                    results.append((idx, None))
+                else:
+                    results.append((idx, result))
+
+            return user_idx, df, results, llm_queue
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, n_users)) as pool:
+            futures = {
+                pool.submit(_run_layers_1_to_3, item): item[0]
+                for item in enumerate(classifiers_and_dfs)
+            }
+            for future in as_completed(futures):
+                user_idx, df, results, llm_queue = future.result()
+                processed[user_idx] = (df, results, llm_queue)
+
+        # ── Phase 2: Collect & deduplicate LLM queue across ALL users ─────────
+        # Key insight: "AIRTIME PURCHASE MTN" from user A and user B have the
+        # same narration fingerprint → call LLM once, reuse for both.
+        unique_items: Dict[str, dict] = {}   # cache_key → representative item
+        # Per-user list of (item, cache_key) so we can fan results back later
+        user_key_lists: List[List[tuple]] = [[] for _ in range(n_users)]
+
+        for user_idx, (df, results, llm_queue) in enumerate(processed):
+            for item in llm_queue:
+                k = shared_cache._key(item["narration"], item["direction"])
+                user_key_lists[user_idx].append((item, k))
+                if k not in unique_items:
+                    unique_items[k] = item
+
+        # ── Phase 3: LLM — minimum possible API calls ─────────────────────────
+        llm_result_by_key: Dict[str, ClassifyResult] = {}
+
+        if unique_items and llm_enabled:
+            all_categories = sorted(ALL_CATEGORIES)
+            # Use first classifier's LLM config (all share same key/model)
+            llm_classifier = classifiers_and_dfs[0][0].llm
+            unique_list = list(unique_items.values())
+
+            for batch_start in range(0, len(unique_list), llm_classifier.batch_size):
+                batch = unique_list[batch_start:batch_start + llm_classifier.batch_size]
+                llm_results = llm_classifier.classify_batch(
+                    [{"narration": t["narration"], "amount": t["amount"],
+                      "direction": t["direction"], "date": t["date"]}
+                     for t in batch],
+                    all_categories,
+                )
+                for item, llm_result in zip(batch, llm_results):
+                    llm_result.counterparty = CounterpartyExtractor.extract(
+                        item["narration"]
+                    )
+                    k = shared_cache._key(item["narration"], item["direction"])
+                    llm_result_by_key[k] = llm_result
+                    # Populate shared cache so future requests skip LLM entirely
+                    shared_cache.set(item["narration"], item["direction"], llm_result)
+
+        # ── Phase 4: Fan LLM results back to every user's result list ─────────
+        output_dfs = []
+        for user_idx, (classifier, _) in enumerate(classifiers_and_dfs):
+            df, results, llm_queue = processed[user_idx]
+            result_map_idx = {idx: j for j, (idx, _) in enumerate(results)}
+
+            for item, k in user_key_lists[user_idx]:
+                llm_result = llm_result_by_key.get(k)
+                if llm_result is None:
+                    continue
+                df_idx = item["df_idx"]
+                j = result_map_idx.get(df_idx)
+                if j is not None and results[j][1] is None:
+                    results[j] = (df_idx, llm_result)
+                    if llm_result.source == ClassificationSource.LLM:
+                        classifier.stats["llm"] += 1
+                        classifier.stats["unclassified"] -= 1
+
+            # Write classification columns to the DataFrame
+            result_map = {idx: r for idx, r in results}
+            df["st_category"] = df.index.map(lambda i: result_map[i].category if result_map.get(i) else None)
+            df["st_type"] = df.index.map(lambda i: result_map[i].type if result_map.get(i) else None)
+            df["st_confidence"] = df.index.map(lambda i: result_map[i].confidence if result_map.get(i) else 0)
+            df["st_source"] = df.index.map(lambda i: result_map[i].source.value if result_map.get(i) else "unclassified")
+            df["st_needs_review"] = df.index.map(lambda i: result_map[i].needs_review if result_map.get(i) else True)
+            df["st_counterparty"] = df.index.map(lambda i: result_map[i].counterparty if result_map.get(i) else None)
+            df["st_explanation"] = df.index.map(lambda i: result_map[i].explanation if result_map.get(i) else "")
+            df["st_rule_hit"] = df.index.map(lambda i: result_map[i].rule_hit if result_map.get(i) else None)
+            output_dfs.append(df)
+
+        return output_dfs
+
+
+# ═══════════════════════════════════════════════════════════════
+# BANK STATEMENT PDF PARSER
+# ═══════════════════════════════════════════════════════════════
+
+class BankStatementParser:
+    """
+    Multi-bank PDF statement parser for Nigerian banks.
+
+    Handles:
+    - GTBank (Date/Deposit/Withdrawal format, null bytes in headers)
+    - Access/GTB legacy (Trans. Date/Credits/Debits format)
+    - UBA, Zenith, First Bank, and other Nigerian bank formats
+    - Continuation tables across pages (no header on pages 2+)
+    - Password-protected PDFs (via pikepdf)
+
+    Usage:
+        parser = BankStatementParser()
+        df = parser.parse("statement.pdf")
+        # Returns DataFrame with columns:
+        # Trans_Date, Reference, Remarks, Value_Date, Credits, Debits,
+        # Balance, direction, amount, narration
+    """
+
+    # Canonical column names used by the classifier
+    COLUMN_ALIASES = {
+        # Date columns
+        "Date": "Trans_Date",
+        "Trans. Date": "Trans_Date",
+        "Trans Date": "Trans_Date",
+        "Transaction Date": "Trans_Date",
+        "Post Date": "Trans_Date",
+        "Txn Date": "Trans_Date",
+        # Value date
+        "ValueDate": "Value_Date",
+        "Value. Date": "Value_Date",
+        "Value Date": "Value_Date",
+        # Description / narration
+        "Description": "Remarks",
+        "Narration": "Remarks",
+        "Particulars": "Remarks",
+        "Details": "Remarks",
+        "Descrip on": "Remarks",       # null-byte cleaned (space variant)
+        "Descripon": "Remarks",         # null-byte cleaned (no space variant)
+        # Money columns
+        "Deposit": "Credits",
+        "Credit": "Credits",
+        "Deposits": "Credits",
+        "Withdrawal": "Debits",
+        "Debit": "Debits",
+        "Withdrawals": "Debits",
+    }
+
+    # Money column names we look for in header detection
+    MONEY_COLUMNS = {
+        "Deposit", "Withdrawal", "Debits", "Credits",
+        "Debit", "Credit", "Deposits", "Withdrawals",
+    }
+
+    def __init__(self):
+        pass
+
+    def parse(self, pdf_path: str) -> "pd.DataFrame":
+        """
+        Parse a bank statement PDF and return a clean DataFrame.
+
+        Args:
+            pdf_path: Path to the PDF file (can be encrypted).
+
+        Returns:
+            DataFrame with columns: Trans_Date, Reference, Remarks,
+            Value_Date, Credits, Debits, Balance, direction, amount, narration
+        """
+        import pdfplumber
+        import pandas as pd
+
+        all_rows = []
+        header = None
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                if not tables:
+                    continue
+
+                for table in tables:
+                    if not table or len(table) < 1:
+                        continue
+
+                    # Clean the first row (potential header)
+                    first_row_clean = self._clean_row(table[0])
+
+                    # Check if this row is a header
+                    if header is None and self._is_header_row(first_row_clean):
+                        header = first_row_clean
+                        # Remaining rows are data
+                        data_rows = table[1:]
+                    elif header is not None:
+                        # Header already found — check if this is a continuation table
+                        # or a non-transaction table (account info, summary)
+                        if self._is_header_row(first_row_clean):
+                            # Duplicate header on a new page — skip it, take data rows
+                            data_rows = table[1:]
+                        elif self._is_data_row(first_row_clean):
+                            # Continuation table — all rows are data
+                            data_rows = table
+                        else:
+                            # Non-transaction table (account info, summary) — skip
+                            continue
+                    else:
+                        # No header yet and this isn't one — skip
+                        continue
+
+                    # Process data rows
+                    for row in data_rows:
+                        cleaned = self._clean_row(row)
+                        # Skip rows that are repeated headers
+                        if self._is_header_row(cleaned):
+                            continue
+                        # Skip completely empty rows
+                        if all(not cell for cell in cleaned):
+                            continue
+                        # Ensure row has same number of columns as header
+                        if len(cleaned) < len(header):
+                            cleaned.extend([""] * (len(header) - len(cleaned)))
+                        elif len(cleaned) > len(header):
+                            cleaned = cleaned[: len(header)]
+                        all_rows.append(cleaned)
+
+        if header is None:
+            raise ValueError(
+                "Could not detect a transaction header in the PDF. "
+                "Expected columns containing 'Date' and a money column "
+                "(Deposit/Withdrawal/Credits/Debits)."
+            )
+
+        if not all_rows:
+            raise ValueError(
+                "Header was detected but no transaction data rows were found."
+            )
+
+        # Build DataFrame
+        df = pd.DataFrame(all_rows, columns=header)
+
+        # Normalize column names
+        df = self._normalize_columns(df)
+
+        # Clean amounts
+        df = self._clean_amounts(df)
+
+        # Add direction, amount, narration columns
+        df = self._add_direction_and_amount(df)
+
+        return df
+
+    def _clean_row(self, row: list) -> list:
+        """Remove null bytes, strip whitespace from all cells in a row."""
+        cleaned = []
+        for cell in row:
+            if cell is None:
+                cleaned.append("")
+            else:
+                # Remove null bytes (PDF rendering artifact) and strip
+                cleaned.append(
+                    re.sub(r"\x00", "", str(cell)).strip()
+                )
+        return cleaned
+
+    def _is_header_row(self, cells: list) -> bool:
+        """
+        Check if a row of cells looks like a transaction table header.
+
+        Matches if it has:
+        - A date column ("Date", "Trans. Date", "Trans Date", etc.) AND
+        - At least one money column (Deposit, Withdrawal, Credits, Debits, etc.)
+        """
+        cell_set = set(cells)
+
+        # Check for date column
+        has_date = any(
+            "Date" in cell
+            for cell in cells
+            if cell  # skip empty strings
+        )
+
+        # Check for money column
+        has_money = bool(cell_set & self.MONEY_COLUMNS)
+
+        return has_date and has_money
+
+    def _is_data_row(self, cells: list) -> bool:
+        """
+        Check if a row looks like a transaction data row (not account info).
+
+        A transaction row typically starts with a date-like value:
+        - DD-Mon-YYYY (e.g., 27-Sep-2025)
+        - DD/MM/YYYY (e.g., 27/09/2025)
+        - DD-MM-YYYY
+        - YYYY-MM-DD
+        """
+        if not cells or not cells[0]:
+            return False
+        first_cell = cells[0].strip()
+        # Match common Nigerian bank date formats
+        return bool(
+            re.match(
+                r"(\d{1,2}[-/]\w{3}[-/]\d{2,4})"  # DD-Mon-YYYY or DD-Mon-YY
+                r"|(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"  # DD/MM/YYYY or DD-MM-YYYY
+                r"|(\d{4}[-/]\d{1,2}[-/]\d{1,2})",  # YYYY-MM-DD
+                first_cell,
+            )
+        )
+
+    def _normalize_columns(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        """Rename columns to canonical names used by the classifier."""
+        rename_map = {}
+        for col in df.columns:
+            # Check direct alias
+            if col in self.COLUMN_ALIASES:
+                rename_map[col] = self.COLUMN_ALIASES[col]
+            else:
+                # Check after cleaning null bytes (already done, but just in case)
+                cleaned = re.sub(r"\x00", "", col).strip()
+                if cleaned in self.COLUMN_ALIASES:
+                    rename_map[col] = self.COLUMN_ALIASES[cleaned]
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+        return df
+
+    def _clean_amounts(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        """Parse money strings in Credits, Debits, Balance columns."""
+        import pandas as pd
+
+        money_cols = ["Credits", "Debits", "Balance"]
+        for col in money_cols:
+            if col in df.columns:
+                df[col] = (
+                    df[col]
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace('"', "", regex=False)
+                    .str.replace("₦", "", regex=False)
+                    .str.replace("NGN", "", regex=False)
+                    .str.extract(r"([-+]?\d*\.?\d+)")[0]
+                    .astype(float)
+                )
+
+        return df
+
+    def _add_direction_and_amount(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        """Add direction (debit/credit), amount, and narration columns."""
+        import pandas as pd
+        import numpy as np
+
+        def get_direction(row):
+            d = row.get("Debits")
+            c = row.get("Credits")
+            if pd.notna(d) and d > 0:
+                return "debit"
+            if pd.notna(c) and c > 0:
+                return "credit"
+            return "debit"
+
+        def get_amount(row):
+            if row["direction"] == "debit":
+                val = row.get("Debits", 0)
+                return val if pd.notna(val) else 0
+            val = row.get("Credits", 0)
+            return val if pd.notna(val) else 0
+
+        df["direction"] = df.apply(get_direction, axis=1)
+        df["amount"] = df.apply(get_amount, axis=1)
+
+        # Set narration column (alias for Remarks)
+        if "Remarks" in df.columns:
+            df["narration"] = (
+                df["Remarks"]
+                .astype(str)
+                .str.replace(r"\s*None\"?$", "", regex=True)
+                .str.replace("nan", "", regex=False)
+                .str.replace('"', "", regex=False)
+                .str.replace("\n", " ", regex=False)
+                .str.replace("  ", " ", regex=False)
+                .str.strip()
+            )
+        else:
+            # If no Remarks column, try to build from non-standard columns
+            known_cols = {
+                "Trans_Date", "Value_Date", "Reference",
+                "Credits", "Debits", "Balance",
+                "direction", "amount",
+            }
+            extra_cols = [c for c in df.columns if c not in known_cols]
+            if extra_cols:
+                df["narration"] = (
+                    df[extra_cols].astype(str).agg(" ".join, axis=1)
+                    .str.replace("nan", "", regex=False)
+                    .str.strip()
+                )
+            else:
+                df["narration"] = ""
+
+        # Set date column (alias for Trans_Date)
+        if "Trans_Date" in df.columns:
+            df["date"] = df["Trans_Date"]
+
+        return df
